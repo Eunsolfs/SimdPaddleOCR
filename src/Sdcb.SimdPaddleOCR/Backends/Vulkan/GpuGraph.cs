@@ -197,10 +197,12 @@ internal sealed class GpuGraphModel
         {
             // One tile; n64/n32 stay aliases so CmTile's sg16 cout split is
             // not reused here. 8 lanes keep its 64 fp32 accumulators in
-            // registers (UHD 770: SIMD16 spills, 4x slower).
+            // registers (UHD 770: SIMD16 spills, 4x slower). Without an
+            // 8-lane pin (wave64 Adreno) the register-prefetch form is
+            // miscompiled there; the direct-load build is exact and faster.
             bool sg8 = dev.ComputeSubgroupSize && dev.SubgroupMin <= 8 && dev.SubgroupMax >= 8;
-            _pConv1x1 = Pipe("gemm_nc", 6, 16, sg8 ? 8u : 0u);
-            _pGemmNcS = Pipe("gemm_nc_s", 6, 16, sg8 ? 8u : 0u);
+            _pConv1x1 = sg8 ? Pipe("gemm_nc", 6, 16, 8u) : Pipe("gemm_nc_d", 6, 16);
+            _pGemmNcS = sg8 ? Pipe("gemm_nc_s", 6, 16, 8u) : Pipe("gemm_nc_ds", 6, 16);
             _pConv1x1N64 = _pConv1x1;
             _pConv1x1N32 = _pConv1x1;
         }

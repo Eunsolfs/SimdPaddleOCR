@@ -15,6 +15,10 @@
 // wider SIMD spills them. Bindings and the 16-byte push constant match
 // conv1x1_cm.
 //
+// -DDIRECT (devices that cannot pin a narrow subgroup, e.g. Adreno wave64):
+// each tile goes straight from global memory into shared memory, no
+// register prefetch. Adreno's compiler miscomputes the prefetch form.
+//
 // flags: bit0 hasBias, bit1 hasResidual, bit3 dual output, bits[4:7] activation
 //   act: 0=none 1=relu 2=gelu 3=hardswish 4=sigmoid
 //   bit10 (1024): dual output stores the pre-activation value
@@ -90,6 +94,7 @@ void main()
     for (uint i = 0u; i < TM * TN; i++) acc[i] = 0.0;
 
     f16vec4 z = f16vec4(float16_t(0.0));
+#ifndef DIRECT
     f16vec4 ra[AV];
     f16vec4 rb[BV];
     for (uint t = 0u; t < AV; t++)
@@ -106,6 +111,7 @@ void main()
         uint gn = n0 + r, gk = cv * 4u;
         rb[t] = (e < BN * AK && gn < p.nDim && gk < p.kDim) ? w[gn * kv + (gk >> 2u)] : z;
     }
+#endif
 
     for (uint k0 = 0u; k0 < p.kDim; k0 += BK)
     {
@@ -115,7 +121,12 @@ void main()
             if (e < BM * AK)
             {
                 uint r = e / AK, cv = e - r * AK;
+#ifdef DIRECT
+                uint gm = m0 + r, gk = k0 + cv * 4u;
+                vec4 f = vec4((gm < p.mDim && gk < p.kDim) ? x[gm * kv + (gk >> 2u)] : z);
+#else
                 vec4 f = vec4(ra[t]);
+#endif
                 As((cv * 4u + 0u) * BM + r) = f.x;
                 As((cv * 4u + 1u) * BM + r) = f.y;
                 As((cv * 4u + 2u) * BM + r) = f.z;
@@ -128,7 +139,12 @@ void main()
             if (e < BN * AK)
             {
                 uint r = e / AK, cv = e - r * AK;
+#ifdef DIRECT
+                uint gn = n0 + r, gk = k0 + cv * 4u;
+                vec4 f = vec4((gn < p.nDim && gk < p.kDim) ? w[gn * kv + (gk >> 2u)] : z);
+#else
                 vec4 f = vec4(rb[t]);
+#endif
                 Bs((cv * 4u + 0u) * BN + r) = f.x;
                 Bs((cv * 4u + 1u) * BN + r) = f.y;
                 Bs((cv * 4u + 2u) * BN + r) = f.z;
@@ -136,6 +152,7 @@ void main()
             }
         }
         barrier();
+#ifndef DIRECT
         uint k1 = k0 + BK;
         if (k1 < p.kDim)
         {
@@ -154,6 +171,7 @@ void main()
                 rb[t] = (e < BN * AK && gn < p.nDim && gk < p.kDim) ? w[gn * kv + (gk >> 2u)] : z;
             }
         }
+#endif
         for (uint kk = 0u; kk < BK; kk++)
         {
             float a[TM];
