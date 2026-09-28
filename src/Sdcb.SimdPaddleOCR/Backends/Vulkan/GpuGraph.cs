@@ -80,9 +80,11 @@ internal sealed class GpuGraphModel
     private readonly VkPipeline? _pCmD, _pCmDN64, _pCmDN32, _pDw4A;
     private readonly bool _lite;
     private bool _nocm;
+    // gemm_nc built with the unrolled no-act / relu / hardswish, single-output tail
+    private readonly VkPipeline? _pGemmNcS;
     // No 16×16×16 coopmat. The kernel is in gemm_nc.comp; the route stays
-    // off. UHD 770 medians (docs/vulkan-uhd770.md): tiny 99.5 vs
-    // 55.2 ms, small 352 vs 134, medium 1629 vs 823, all slower than sharp.
+    // off. UHD 770 medians (docs/vulkan-uhd770.md): tiny 89 vs
+    // 68 ms, small 248 vs 147, medium 1091 vs 563, all slower than sharp.
     // false: throw before any coopmat SPIR-V is compiled — Intel's compiler
     // aborts the process on those shaders — so Vulkan/Auto fall back to CPU
     // at session creation.
@@ -234,9 +236,12 @@ internal sealed class GpuGraphModel
         else if (RouteNocm)
         {
             // subgroup-free GEMM. One tile; n64/n32 stay aliases so CmTile's
-            // sg16 cout split is not reused here.
+            // sg16 cout split is not reused here. 8 lanes keep its 64 fp32
+            // accumulators in registers (UHD 770: SIMD16 spills, 4x slower).
             _nocm = true;
-            _pConv1x1 = Pipe("gemm_nc", 6, 16);
+            bool sg8 = dev.ComputeSubgroupSize && dev.SubgroupMin <= 8 && dev.SubgroupMax >= 8;
+            _pConv1x1 = Pipe("gemm_nc", 6, 16, sg8 ? 8u : 0u);
+            _pGemmNcS = Pipe("gemm_nc_s", 6, 16, sg8 ? 8u : 0u);
             _pConv1x1N64 = _pConv1x1;
             _pConv1x1N32 = _pConv1x1;
         }
@@ -879,8 +884,10 @@ internal sealed class GpuGraphModel
         // coopmat tile: cout<=32 -> 512x32, cout<=64 -> 256x64, else 128x128
         // sg32: cout<=32 -> 128x32, cout<=64 -> 128x64, else 128x128
         // m/k > 0: a plain GEMM that may take the direct-load kernel (lite)
+        VkPipeline NcTail(VkPipeline p, uint f) =>
+            _nocm && (f & 8u) == 0 && ((f >> 4) & 7u) is 0 or 1 or 3 ? _pGemmNcS! : p;
         (VkPipeline pipe, uint tm, uint tn) CmTile(int c, long m = 0, int k = 0) =>
-            _nocm ? (_pConv1x1, 32u, 64u)
+            _nocm ? (_pConv1x1, 64u, 64u)
             : _pCmD is not null && m >= 16 && k > 0 && k % 16 == 0
                 ? (c <= 32 ? (_pCmDN32!, 128u, 32u) : c <= 64 ? (_pCmDN64!, 128u, 64u) : (_pCmD, 128u, 128u))
             : _sg32 ? (c <= 32 ? (_pConv1x1N32, 128u, 32u)
@@ -1319,7 +1326,7 @@ internal sealed class GpuGraphModel
                                 cb = [.. cb, (arena, SlotOf(psv.se), 2)];
                                 cpc = [.. cpc, mImg];
                             }
-                            Emit(cp, $"conv1x1 n{ni} {M}x{cin}x{cout}", cb, cpc,
+                            Emit(NcTail(cp, flags), $"conv1x1 n{ni} {M}x{cin}x{cout}", cb, cpc,
                                 (M + tm - 1) / tm, (uint)((cout + tn - 1) / tn));
                         }
                     }
@@ -1518,7 +1525,7 @@ internal sealed class GpuGraphModel
                         else
                         {
                             var (cp, tm, tn) = CmTile(cout);
-                            Emit(cp, $"im2colconv n{ni} {M}x{Kp}x{cout}",
+                            Emit(NcTail(cp, flags), $"im2colconv n{ni} {M}x{Kp}x{cout}",
                                 [(arena, im2colOff, 2), (wbuf, 0, 2),
                                  (biasBuf, 0, 2), (arena, 0, 2), (arena, off[outPhys], 2)],
                                 [M, (uint)cout, (uint)Kp, flags],
@@ -2160,7 +2167,7 @@ internal sealed class GpuGraphModel
                         break;
                     }
                     var (cp2, tm2, tn2) = CmTile(mmN, mmM, mmK);
-                    Emit(cp2, $"matmul n{ni} {mmM}x{mmK}x{mmN}",
+                    Emit(NcTail(cp2, mmFlags), $"matmul n{ni} {mmM}x{mmK}x{mmN}",
                         [(arena, SlotOf(node.Inputs[0]), 2),
                          (ConstGemmW(checked((int)node.Inputs[1]), mmK, mmN), 0, 2),
                          (mmBias, 0, 2), (arena, 0, 2),
