@@ -81,8 +81,8 @@ internal sealed class GpuGraphModel
     private readonly bool _lite;
     // No coopmat of the selected cm set's shape (VkDevice.CoopGemm):
     // subgroup-free gemm_nc instead of every cm pipe
-    // (Intel's compiler aborts the process on those shaders). Sessions only
-    // reach this for an explicit OcrBackend.Vulkan — GpuBackend.UsesGpu.
+    // (Intel's compiler aborts the process on those shaders). Auto sessions
+    // reach this only on wave64-minimum devices — GpuBackend.UsesGpu.
     private readonly bool _nocm;
     // gemm_nc built with the unrolled no-act / relu / hardswish, single-output tail
     private readonly VkPipeline? _pGemmNcS;
