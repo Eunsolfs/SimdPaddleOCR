@@ -417,6 +417,29 @@ internal unsafe sealed class VkDevice : IDisposable
                     memType = (uint)i;
             }
         }
+        if (memType == uint.MaxValue && preferHost)
+        {
+            // UMA (Intel iGPU): every heap is DEVICE_LOCAL, so the non-local
+            // preference above matches nothing. Cached host-visible is still
+            // the CPU readback type. Discrete parts never get here — they
+            // have a non-local host type and already returned.
+            for (int i = 0; i < (int)MemProps.MemoryTypeCount && memType == uint.MaxValue; i++)
+            {
+                if ((req.MemoryTypeBits & (1u << i)) == 0) continue;
+                uint f = MemProps.TypeAt(i).PropertyFlags;
+                if ((f & (VkConst.MemHostVisible | VkConst.MemHostCoherent | VkConst.MemHostCached))
+                    == (VkConst.MemHostVisible | VkConst.MemHostCoherent | VkConst.MemHostCached))
+                    memType = (uint)i;
+            }
+            for (int i = 0; i < (int)MemProps.MemoryTypeCount && memType == uint.MaxValue; i++)
+            {
+                if ((req.MemoryTypeBits & (1u << i)) == 0) continue;
+                uint f = MemProps.TypeAt(i).PropertyFlags;
+                if ((f & (VkConst.MemHostVisible | VkConst.MemHostCoherent))
+                    == (VkConst.MemHostVisible | VkConst.MemHostCoherent))
+                    memType = (uint)i;
+            }
+        }
         if (memType == uint.MaxValue)
             throw new PlatformNotSupportedException($"Vulkan: no suitable memory type for {bytes}-byte buffer (hostVisible={hostVisible})");
 
