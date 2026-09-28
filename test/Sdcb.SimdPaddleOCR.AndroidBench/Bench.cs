@@ -20,6 +20,8 @@ static class Bench
             "--conc" => Prof.Conc(args),
             "--rawbench" => Caps.RawBench(args),
             "--gemm" => GemmTest.Run(args),
+            "--gemmsweep" => GemmTest.Sweep(args),
+            "--peak" => GemmTest.Peak(args),
             // --layers <model> <det|rec> <N> <H> <W> [first] [last]
             "--layers" => LayerProbe.Run(Paths.ModelPath(args[1], args[2]), int.Parse(args[3]), int.Parse(args[4]),
                 int.Parse(args[5]), args.Length > 6 ? int.Parse(args[6]) : 0,

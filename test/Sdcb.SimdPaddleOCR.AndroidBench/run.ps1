@@ -75,7 +75,15 @@ while (((Get-Date) - $t0).TotalSeconds -lt $TimeoutSec) {
     if ($done -match "^\d+$") { $result = [int]$done; break }
     $procId = (& $Adb shell "pidof $pkg") -join ""
     if ($procId) { $started = $true }
-    elseif ($started -or ((Get-Date) - $t0).TotalSeconds -gt 30) { break }
+    elseif ($started -or ((Get-Date) - $t0).TotalSeconds -gt 30) {
+        # the app writes .done and then kills itself: look once more
+        Start-Sleep -Seconds 1
+        $done = (& $Adb shell "cat $remote/out/$Run.done 2>/dev/null") -join ""
+        $lines = @(& $Adb shell "cat $remote/out/$Run.log 2>/dev/null")
+        for ($i = $seen; $i -lt $lines.Count; $i++) { Write-Output $lines[$i] }
+        if ($done -match "^\d+$") { $result = [int]$done }
+        break
+    }
 }
 
 & $Adb pull "$remote/out/." "$local" 2>&1 | Out-Null

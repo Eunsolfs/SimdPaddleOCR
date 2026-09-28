@@ -1,0 +1,38 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+// FMA peak probe: 8 independent vec4 chains per thread, fully unrolled
+// inner body, 512 iterations: 2 * 4 * 8 * 512 = 32768 flop per thread.
+// -DF16 runs the same on f16vec4.
+// Rebuild: glslc -O --target-env=vulkan1.1 [-DF16] peak.comp -o peak[16].spv
+
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer O { vec4 o[]; };
+layout(push_constant) uniform PC { float s; } p;
+
+#ifdef F16
+#define T f16vec4
+#define S(x) float16_t(x)
+#else
+#define T vec4
+#define S(x) (x)
+#endif
+
+void main()
+{
+    T m = T(S(p.s)), c = T(S(1e-4));
+    float b = float(gl_LocalInvocationID.x) * 1e-3;
+    T a0 = T(S(b)), a1 = T(S(b + 0.1)), a2 = T(S(b + 0.2)), a3 = T(S(b + 0.3));
+    T a4 = T(S(b + 0.4)), a5 = T(S(b + 0.5)), a6 = T(S(b + 0.6)), a7 = T(S(b + 0.7));
+    for (int it = 0; it < 64; it++)
+    {
+        [[unroll]] for (int u = 0; u < 8; u++)
+        {
+            a0 = fma(a0, m, c); a1 = fma(a1, m, c); a2 = fma(a2, m, c); a3 = fma(a3, m, c);
+            a4 = fma(a4, m, c); a5 = fma(a5, m, c); a6 = fma(a6, m, c); a7 = fma(a7, m, c);
+        }
+    }
+    T r = a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7;
+    if (float(r.x) == 12345.0) o[gl_GlobalInvocationID.x] = vec4(r);
+}
