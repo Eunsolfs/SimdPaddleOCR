@@ -24,6 +24,7 @@ internal unsafe sealed class VkDevice : IDisposable
     public bool Coop8x16x16;           // same types, MxNxK 8x16x16 (Arc)
     public uint SubgroupMin = 1, SubgroupMax = 128;
     public uint MaxSharedMemory;       // maxComputeSharedMemorySize (bytes per workgroup)
+    public ulong MaxStorageRange = uint.MaxValue;   // maxStorageBufferRange (bytes per binding)
     public int CoopM, CoopN, CoopK;    // best fp16->fp32 subgroup coopmat config
     public bool Storage16Bit;          // storageBuffer16BitAccess + shaderInt16 enabled
     public bool ShaderFloat16;         // shaderFloat16 (VK_KHR_shader_float16_int8) enabled — required by fp16 shaders
@@ -107,6 +108,7 @@ internal unsafe sealed class VkDevice : IDisposable
         d.VendorId = props.VendorID;
         d.TimestampPeriodNs = props.TimestampPeriodNs;
         d.MaxSharedMemory = props.MaxComputeSharedMemorySize;
+        d.MaxStorageRange = props.MaxStorageBufferRange;
 
         uint nqf = 0;
         Vk.vkGetPhysicalDeviceQueueFamilyProperties(d.PhysDevice, &nqf, null);

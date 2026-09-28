@@ -669,6 +669,9 @@ internal sealed class GpuGraphModel
             if (i == inIdx && inCinPad != 0)
                 sz = numel[i] / shapes[i][1] * inCinPad;
             slabElems[i] = (sz + 7) / 8 * 8 + 128 * 64;
+            if (slabElems[i] * 2 > (long)_dev.MaxStorageRange)
+                throw new NotSupportedException(
+                    $"tensor {i} ({sz * 2} B) exceeds maxStorageBufferRange {_dev.MaxStorageRange}");
             cursor += slabElems[i];
         }
         // the im2col scratch sits past every slab; its size (and the arena
@@ -1411,8 +1414,11 @@ internal sealed class GpuGraphModel
                         // sg32: implicit-GEMM coopmat conv instead (same tap
                         // addressing, tensor cores; any K, batched or not)
                         bool convkCm = _sg32 && cinIn % 8 == 0 && scalarBias == 0;
+                        // the im2col matrix is one binding: past
+                        // maxStorageBufferRange (Adreno: 128 MB) go direct
+                        bool im2colFits = (long)M * Kp * 2 <= (long)_dev.MaxStorageRange;
                         if (convkCm || (cout % 4 == 0 && scalarBias == 0 && cinIn % 4 == 0
-                            && (nb > 1 || Kp <= (Environment.GetEnvironmentVariable(
+                            && (nb > 1 || !im2colFits || Kp <= (Environment.GetEnvironmentVariable(
                                 "SIMD_OCR_CONVD_KMAX") is string km
                                 ? int.Parse(km) : 1024))
                             && Environment.GetEnvironmentVariable("SIMD_OCR_NODCONV") == null))
@@ -1498,6 +1504,9 @@ internal sealed class GpuGraphModel
                         if (nb > 1)
                             throw new NotSupportedException(
                                 $"im2col conv path lacks batch support (n{ni})");
+                        if (!im2colFits)
+                            throw new NotSupportedException(
+                                $"im2col matrix {M}x{Kp} exceeds maxStorageBufferRange (n{ni})");
                         maxIm2col = Math.Max(maxIm2col, (long)M * Kp);
                         Emit(_pIm2col, $"im2col n{ni} M{M} K{K}",
                             [(arena, SlotOf(node.Inputs[0]), 2),

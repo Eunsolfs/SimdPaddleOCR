@@ -81,6 +81,10 @@ internal static unsafe partial class Vk
         {
             get { fixed (byte* p = LimitsAndSparse) return *(uint*)(p + 4 + 216); }
         }
+        public uint MaxStorageBufferRange
+        {
+            get { fixed (byte* p = LimitsAndSparse) return *(uint*)(p + 4 + 28); }
+        }
     }
 
     [StructLayout(LayoutKind.Sequential)]
