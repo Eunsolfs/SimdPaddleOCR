@@ -15,8 +15,13 @@ public sealed class PaddleOcrRecognizer : IDisposable
     private readonly PaddleOcrRecognizerOptions _options;
     private readonly CompiledModel _compiled;
     private readonly bool _ownsModel;
-    private readonly List<InferenceSession> _sessions = [];
+    private readonly List<IOcrSession> _sessions = [];
     private readonly object _poolLock = new();
+    // Cleared the first time a GPU session reports it has fallen back to CPU
+    // (emission/compile failure for this model). PaddleOcrAll reads it to stop
+    // picking GPU-shaped (fewer, wider) line batches.
+    private volatile bool _gpuRecAlive = true;
+    internal bool GpuRecAlive => _gpuRecAlive;
     private int _pooledCount;
     private bool _disposed;
 
@@ -159,7 +164,7 @@ public sealed class PaddleOcrRecognizer : IDisposable
         int targetWidth = SelectTargetWidth(sourceWidth, sourceHeight);
         if (profile) PipelineProfiler.Add(PipelineProfiler.RecCacheGet, t);
         t = profile ? PipelineProfiler.Now() : 0;
-        InferenceSession session = RentSession(1, targetWidth);
+        IOcrSession session = RentSession(1, targetWidth);
         // Rented sessions may carry a boosted budget from a previous pooled
         // call; always rebind so the compiled default is the fallback.
         session.IntraOpThreads = intraOpThreads;
@@ -203,19 +208,20 @@ public sealed class PaddleOcrRecognizer : IDisposable
         finally
         {
             long started = profile ? PipelineProfiler.Now() : 0;
+            if (!session.GpuAlive) _gpuRecAlive = false;
             ReturnSession(session);
             if (profile) PipelineProfiler.Add(PipelineProfiler.RecRelease, started);
         }
     }
 
-    private InferenceSession RentSession(int batch, int width)
+    private IOcrSession RentSession(int batch, int width)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(PaddleOcrRecognizer));
         int volume = checked(batch * 3 * 48 * width);
-        InferenceSession? session = TryTakeBestFit(volume);
+        IOcrSession? session = TryTakeBestFit(volume);
         if (session is null)
         {
-            session = _compiled.CreateRequest();
+            session = OnnxSharp.OcrSessionFactory.Create(_compiled, _options.Backend);
             // RunCtcGraph stops before the vocab MatMul; do not plan the
             // [T×vocab] logits/softmax planes that path never writes.
             session.PlanForCtcProjection = true;
@@ -228,7 +234,7 @@ public sealed class PaddleOcrRecognizer : IDisposable
     // seen. Same photo, next request: a different worker ate that max and
     // grew again. Best-fit keeps the fat buffer on the sessions that
     // already paid for it.
-    private InferenceSession? TryTakeBestFit(int volume)
+    private IOcrSession? TryTakeBestFit(int volume)
     {
         lock (_poolLock)
         {
@@ -251,7 +257,7 @@ public sealed class PaddleOcrRecognizer : IDisposable
                 }
             }
             int take = bestFit >= 0 ? bestFit : largest;
-            InferenceSession session = _sessions[take];
+            IOcrSession session = _sessions[take];
             int last = count - 1;
             if (take != last) _sessions[take] = _sessions[last];
             _sessions.RemoveAt(last);
@@ -276,7 +282,7 @@ public sealed class PaddleOcrRecognizer : IDisposable
         int n = lineIndices.Length;
         bool profile = PipelineProfiler.Enabled;
         long t = profile ? PipelineProfiler.Now() : 0;
-        InferenceSession session = RentSession(n, targetWidth);
+        IOcrSession session = RentSession(n, targetWidth);
         session.IntraOpThreads = intraOpThreads;
         if (profile) PipelineProfiler.Add(PipelineProfiler.RecRent, t);
         t = profile ? PipelineProfiler.Now() : 0;
@@ -333,9 +339,161 @@ public sealed class PaddleOcrRecognizer : IDisposable
         {
             long started = profile ? PipelineProfiler.Now() : 0;
             PooledArrays.Return(resizedWidths);
+            if (!session.GpuAlive) _gpuRecAlive = false;
             ReturnSession(session);
             if (profile) PipelineProfiler.Add(PipelineProfiler.RecRelease, started);
         }
+    }
+
+    /// <summary>
+    /// GPU path: every unit (same-target-width line group) of one image runs
+    /// in a single device submission via <see cref="IBatchedCtcSession"/>.
+    /// Units keep their exact widths — no cross-unit padding, so each line's
+    /// activations equal a standalone <see cref="RecognizeBatch"/> of its
+    /// unit. Returns false when the rented session cannot batch (CPU backend /
+    /// fallen back); callers then run the per-unit path, which rewrites every
+    /// entry of <paramref name="results"/>.
+    /// </summary>
+    internal bool TryRecognizeUnitsBatched(byte[] cropBuffer, int[] offsets, int[] cropBytes,
+        int[] widths, int[] heights, IReadOnlyList<int[]> units, int[] recWidths,
+        PaddleOcrRecognitionResult[] results, int intraOpThreads, int preprocessWorkers,
+        bool returnCtcAlignment)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(PaddleOcrRecognizer));
+        if (units.Count == 0) return true;
+        bool profile = PipelineProfiler.Enabled;
+        long t = profile ? PipelineProfiler.Now() : 0;
+        var shapes = new int[units.Count][];
+        long volume = 0;
+        for (int u = 0; u < units.Count; u++)
+        {
+            shapes[u] = [units[u].Length, 3, 48, recWidths[units[u][0]]];
+            volume += (long)units[u].Length * 3 * 48 * recWidths[units[u][0]];
+        }
+        IOcrSession session = RentSessionForVolume(checked((int)volume));
+        session.IntraOpThreads = intraOpThreads;
+        if (profile) PipelineProfiler.Add(PipelineProfiler.RecRent, t);
+        try
+        {
+            if (session is not IBatchedCtcSession batched || !batched.CanRunMany) return false;
+            t = profile ? PipelineProfiler.Now() : 0;
+            Span<float> input = batched.ReshapeMany(shapes);
+            if (profile) PipelineProfiler.Add(PipelineProfiler.RecReshape, t);
+            int total = 0;
+            foreach (int[] unit in units) total += unit.Length;
+            int[] resized = new int[total];
+            int[] lineOf = new int[total], widthOf = new int[total];
+            long[] posOf = new long[total];
+            long started = profile ? PipelineProfiler.Now() : 0;
+            long pos = 0;
+            int k = 0;
+            for (int u = 0; u < units.Count; u++)
+            {
+                int w = shapes[u][3];
+                foreach (int line in units[u])
+                {
+                    if ((long)widths[line] * heights[line] > _options.MaxImagePixels)
+                        throw new InvalidOperationException("Source image exceeds MaxImagePixels.");
+                    lineOf[k] = line; widthOf[k] = w; posOf[k] = pos;
+                    pos += 3 * 48 * w;
+                    k++;
+                }
+            }
+            // Exclusive window between the GPU CLS and REC submissions: lines
+            // resize into disjoint slices of the batched input, in parallel.
+            unsafe
+            {
+                fixed (float* inputPtr = input)
+                {
+                    nint inputAddress = (nint)inputPtr;
+                    bool nhwc = session.InputIsNhwc;
+                    PPOCRPreprocess.ForLines(total, preprocessWorkers, session.ResizeWorkspace, (j, workspace) =>
+                    {
+                        int line = lineOf[j], sw = widths[line], sh = heights[line], w = widthOf[j];
+                        var dst = new Span<float>((float*)inputAddress + posOf[j], 3 * 48 * w);
+                        resized[j] = PPOCRPreprocess.Rec(
+                            cropBuffer.AsSpan(offsets[line], cropBytes[line]), sw, sh,
+                            checked(sw * 3), w, dst, workspace, nhwc);
+                    });
+                }
+            }
+            if (profile) PipelineProfiler.Add(PipelineProfiler.RecPreprocess, started);
+            started = profile ? PipelineProfiler.Now() : 0;
+            if (!batched.TryResolveManyHead(out int[] rows, out CtcHead head))
+                return false;
+            if (head.Columns != ClassCount)
+                throw new InvalidDataException("Recognizer output shape is incompatible with dictionary.");
+            int[] batches = new int[units.Count];
+            int[] rowStart = new int[units.Count + 1], lineStart = new int[units.Count + 1];
+            for (int u = 0; u < units.Count; u++)
+            {
+                batches[u] = units[u].Length;
+                rowStart[u + 1] = rowStart[u] + units[u].Length * rows[u];
+                lineStart[u + 1] = lineStart[u] + units[u].Length;
+            }
+            int totalRows = rowStart[units.Count];
+            int[] indices = PooledArrays.Rent<int>(totalRows);
+            float[] scores = PooledArrays.Rent<float>(totalRows);
+            try
+            {
+                // Batches of units arrive while later ones still run on the
+                // GPU; each batch's activations are back to back, so one
+                // ArgMax call covers it (same per-row kernel as a per-unit call).
+                bool Ready(float[] acts, int[] offsets, int first, int count)
+                {
+                    int r0 = rowStart[first], r1 = rowStart[first + count];
+                    for (int u = first; u < first + count; u++)
+                        if (offsets[u] != rowStart[u] * head.Inner)
+                            throw new InvalidOperationException("REC activations are not contiguous.");
+                    ReadOnlySpan<float> weights = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(head.Weights);
+                    ReadOnlySpan<float> bias = head.Bias is null ? []
+                        : System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(head.Bias);
+                    if (!MatMul.TryArgMaxUnits(acts.AsSpan(r0 * head.Inner, (r1 - r0) * head.Inner), weights, bias,
+                            indices.AsSpan(r0, r1 - r0), scores.AsSpan(r0, r1 - r0),
+                            batches.AsSpan(first, count), rows.AsSpan(first, count),
+                            head.Inner, head.Columns, head.Packed, intraOpThreads))
+                        return false;
+                    for (int u = first; u < first + count; u++)
+                    {
+                        int T = rows[u];
+                        for (int i = 0; i < units[u].Length; i++)
+                        {
+                            int row = rowStart[u] + i * T, line = lineStart[u] + i;
+                            results[units[u][i]] = Decode([], indices.AsSpan(row, T), scores.AsSpan(row, T),
+                                T, resized[line], shapes[u][3], false, returnCtcAlignment);
+                        }
+                    }
+                    return true;
+                }
+                // false: GPU fell back or ArgMax declined — the caller's
+                // per-unit path rewrites every result
+                bool ok = batched.TryRunManyUntilCtcProjection(Ready);
+                if (profile) PipelineProfiler.Add(PipelineProfiler.RecGraph, started);
+                return ok;
+            }
+            finally
+            {
+                PooledArrays.Return(indices);
+                PooledArrays.Return(scores);
+            }
+        }
+        finally
+        {
+            if (!session.GpuAlive) _gpuRecAlive = false;
+            ReturnSession(session);
+        }
+    }
+
+    private IOcrSession RentSessionForVolume(int volume)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(PaddleOcrRecognizer));
+        IOcrSession? session = TryTakeBestFit(volume);
+        if (session is null)
+        {
+            session = OnnxSharp.OcrSessionFactory.Create(_compiled, _options.Backend);
+            session.PlanForCtcProjection = true;
+        }
+        return session;
     }
 
     /// <summary>
@@ -343,7 +501,7 @@ public sealed class PaddleOcrRecognizer : IDisposable
     /// method owns compact ArgMax scratch via ArrayPool (Recognizer is
     /// concurrent across rented sessions, so instance fields are unsafe).
     /// </summary>
-    private CtcDecodeInput RunCtcGraph(InferenceSession session, ReadOnlySpan<float> input)
+    private CtcDecodeInput RunCtcGraph(IOcrSession session, ReadOnlySpan<float> input)
     {
         if (session.TryRunUntilCtcProjection(input, out CtcProjectionOperands ops))
         {
@@ -368,7 +526,7 @@ public sealed class PaddleOcrRecognizer : IDisposable
         return CtcDecodeInput.FromDense(dense, logits);
     }
 
-    private void ReturnSession(InferenceSession session)
+    private void ReturnSession(IOcrSession session)
     {
         lock (_poolLock)
         {
@@ -522,7 +680,7 @@ public sealed class PaddleOcrRecognizer : IDisposable
 
     public void Dispose()
     {
-        InferenceSession[] draining;
+        IOcrSession[] draining;
         lock (_poolLock)
         {
             if (_disposed) return;
@@ -531,7 +689,7 @@ public sealed class PaddleOcrRecognizer : IDisposable
             _sessions.Clear();
             _pooledCount = 0;
         }
-        foreach (InferenceSession session in draining)
+        foreach (IOcrSession session in draining)
             session.Dispose();
         _compiled.Dispose();
         if (_ownsModel) _model.Dispose();
