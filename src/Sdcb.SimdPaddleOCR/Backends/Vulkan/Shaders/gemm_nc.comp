@@ -17,7 +17,9 @@
 //
 // -DDIRECT (devices that cannot pin a narrow subgroup, e.g. Adreno wave64):
 // each tile goes straight from global memory into shared memory, no
-// register prefetch. Adreno's compiler miscomputes the prefetch form.
+// register prefetch (Adreno's compiler miscomputes the prefetch form);
+// tiles stay fp16 in shared memory with BK 8 (Adreno 750: 30% faster than
+// fp32 tiles with BK 16), the tail stages through its own fp32 array.
 //
 // flags: bit0 hasBias, bit1 hasResidual, bit3 dual output, bits[4:7] activation
 //   act: 0=none 1=relu 2=gelu 3=hardswish 4=sigmoid
@@ -28,6 +30,9 @@
 #endif
 #ifndef BN
 #define BN 64u
+#endif
+#if defined(DIRECT) && !defined(BK)
+#define BK 8u
 #endif
 #ifndef BK
 #define BK 16u
@@ -59,7 +64,15 @@ layout(push_constant) uniform PC { uint mDim; uint nDim; uint kDim; uint flags; 
 
 // As = S[0, BK*BM), Bs = S[BK*BM, ...); after the K loop each thread stages
 // one accumulator row at S[tid*TN, +TN), so BK*(BM+BN) >= NTHR*TN
+#ifdef DIRECT
+shared float16_t S[BK * (BM + BN)];
+shared float St[NTHR * TN];
+#define LDS(v) float(v)
+#else
 shared float S[BK * (BM + BN)];
+#define St S
+#define LDS(v) (v)
+#endif
 #define As(i) S[i]
 #define Bs(i) S[BK * BM + (i)]
 
@@ -123,7 +136,7 @@ void main()
                 uint r = e / AK, cv = e - r * AK;
 #ifdef DIRECT
                 uint gm = m0 + r, gk = k0 + cv * 4u;
-                vec4 f = vec4((gm < p.mDim && gk < p.kDim) ? x[gm * kv + (gk >> 2u)] : z);
+                f16vec4 f = (gm < p.mDim && gk < p.kDim) ? x[gm * kv + (gk >> 2u)] : z;
 #else
                 vec4 f = vec4(ra[t]);
 #endif
@@ -141,7 +154,7 @@ void main()
                 uint r = e / AK, cv = e - r * AK;
 #ifdef DIRECT
                 uint gn = n0 + r, gk = k0 + cv * 4u;
-                vec4 f = vec4((gn < p.nDim && gk < p.kDim) ? w[gn * kv + (gk >> 2u)] : z);
+                f16vec4 f = (gn < p.nDim && gk < p.kDim) ? w[gn * kv + (gk >> 2u)] : z;
 #else
                 vec4 f = vec4(rb[t]);
 #endif
@@ -176,8 +189,8 @@ void main()
         {
             float a[TM];
             float b[TN];
-            for (uint i = 0u; i < TM; i++) a[i] = As(kk * BM + ty * TM + i);
-            for (uint j = 0u; j < TN; j++) b[j] = Bs(kk * BN + tx * TN + j);
+            for (uint i = 0u; i < TM; i++) a[i] = LDS(As(kk * BM + ty * TM + i));
+            for (uint j = 0u; j < TN; j++) b[j] = LDS(Bs(kk * BN + tx * TN + j));
             for (uint i = 0u; i < TM; i++)
                 for (uint j = 0u; j < TN; j++)
                     acc[i * TN + j] = fma(a[i], b[j], acc[i * TN + j]);
@@ -220,14 +233,14 @@ void main()
     // copies, which push the accumulators into spills
     for (uint i = 0u; i < TM; i++)
     {
-        for (uint j = 0u; j < TN; j++) S[tid * TN + j] = acc[i * TN + j];
+        for (uint j = 0u; j < TN; j++) St[tid * TN + j] = acc[i * TN + j];
         uint gm = mBase + i;
         if (gm >= p.mDim) continue;
         [[dont_unroll]] for (uint j = 0u; j < TN; j++)
         {
             uint gn = nBase + j;
             if (gn >= p.nDim) continue;
-            float v = S[tid * TN + j];
+            float v = St[tid * TN + j];
             if (hasBias) v += float(bias[gn]);
             if (hasRes) v += float(res[gm * p.nDim + gn]);
             o[gm * p.nDim + gn] = actf(v, act, p.flags);
