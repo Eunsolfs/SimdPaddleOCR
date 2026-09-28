@@ -1278,6 +1278,10 @@ internal sealed class GpuGraphModel
                         if (dotOk && _sg32 && (long)M * cout > 1L << (_lite ? 16 : 18)
                             && (hasPs || !addpsSrc.ContainsKey(Phys(checked((int)node.Inputs[0])))))
                             dotOk = false;
+                        // no-coopmat GEMM likewise; it has no SE-prescale variant
+                        if (dotOk && _nocm && !hasPs && (long)M * cout > 1L << 16
+                            && !addpsSrc.ContainsKey(Phys(checked((int)node.Inputs[0]))))
+                            dotOk = false;
                         if (dotOk)
                         {
                             // small-K pointwise conv: direct dot kernel beats coopmat.
@@ -1509,7 +1513,8 @@ internal sealed class GpuGraphModel
                             Div256(M * (long)(Kp / 4)));
                         VkBuffer wbuf = ConstTapMajor(checked((int)node.Inputs[1]),
                             cout, cin, kH, kW, Kp, cinPad: cinIn);
-                        if (cout % 4 == 0 && scalarBias == 0 && Kp <= 128)
+                        if (cout % 4 == 0 && scalarBias == 0 && Kp <= 128
+                            && !(_nocm && (long)M * cout > 1L << 16))
                         {
                             VkBuffer wk = ConstKMajor(checked((int)node.Inputs[1]),
                                 cout, cin, kH * kW, Kp, cinIn);
