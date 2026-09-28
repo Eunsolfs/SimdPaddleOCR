@@ -1421,10 +1421,12 @@ internal sealed class GpuGraphModel
                         // the im2col matrix is one binding: past
                         // maxStorageBufferRange (Adreno: 128 MB) go direct
                         bool im2colFits = (long)M * Kp * 2 <= (long)_dev.MaxStorageRange;
+                        // wide no-coopmat parts: direct at every K measured
+                        // (Kp <= 2304 in these models), im2col+GEMM never won
                         if (convkCm || (cout % 4 == 0 && scalarBias == 0 && cinIn % 4 == 0
                             && (nb > 1 || !im2colFits || Kp <= (Environment.GetEnvironmentVariable(
                                 "SIMD_OCR_CONVD_KMAX") is string km
-                                ? int.Parse(km) : 1024))
+                                ? int.Parse(km) : _ncWide ? int.MaxValue : 1024))
                             && Environment.GetEnvironmentVariable("SIMD_OCR_NODCONV") == null))
                         {
                             // stem conv on the fp32 NCHW input: skip nchw2nhwc
