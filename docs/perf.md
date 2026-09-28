@@ -162,7 +162,7 @@ x64 / ARM64 本库 peak 大约少 **300 MB**。c 仍然略省，但更慢。Open
 
 ### Vulkan GPU（RTX 3080 Ti，`8d62a35`）
 
-同机同轮：HOME-MAIN 5800X + RTX 3080 Ti（驱动 581.80），`.NET 10.0.11`，`--engine sharp|vulkan --workers 4 --benchmark-kind simd --warmup 1`，同一 `dataset/` 100 张变尺寸图（对 GPU 最不利的逐图新 shape）。墙钟 n=99。**CPU 列是同轮重测**，不要拿上表 1.4.2 的 `97c1448` mean 硬接（那次 tiny 63.1 / small 200 / medium 585）。B580 另一台机、另一份尺子，见 [vulkan-b580.md](vulkan-b580.md)；Radeon 880M 核显见 [vulkan-880m.md](vulkan-880m.md)。
+同机同轮：HOME-MAIN 5800X + RTX 3080 Ti（驱动 581.80），`.NET 10.0.11`，`--engine sharp|vulkan --workers 4 --benchmark-kind simd --warmup 1`，同一 `dataset/` 100 张变尺寸图（对 GPU 最不利的逐图新 shape）。墙钟 n=99。**CPU 列是同轮重测**，不要拿上表 1.4.2 的 `97c1448` mean 硬接（那次 tiny 63.1 / small 200 / medium 585）。B580 另一台机、另一份尺子，见 [vulkan-b580.md](vulkan-b580.md)；Radeon 880M 核显见 [vulkan-880m.md](vulkan-880m.md)。Intel UHD 770 没有协作矩阵，测完默认仍回 CPU，见 [vulkan-uhd770.md](vulkan-uhd770.md)。
 
 端到端（median ms/图，越低越好；加速 = CPU median / Vulkan median）：
 

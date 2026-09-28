@@ -79,6 +79,14 @@ internal sealed class GpuGraphModel
     // sg32 lite family only: direct-load plain GEMM (M >= 16, K % 16 == 0)
     private readonly VkPipeline? _pCmD, _pCmDN64, _pCmDN32, _pDw4A;
     private readonly bool _lite;
+    private bool _nocm;
+    // No 16×16×16 coopmat. The kernel is in gemm_nc.comp; the route stays
+    // off. UHD 770 medians (docs/vulkan-uhd770.md): tiny 99.5 vs
+    // 55.2 ms, small 352 vs 134, medium 1629 vs 823, all slower than sharp.
+    // false: throw before any coopmat SPIR-V is compiled — Intel's compiler
+    // aborts the process on those shaders — so Vulkan/Auto fall back to CPU
+    // at session creation.
+    private static readonly bool RouteNocm = false;
 
     // fp16 copies of constant tensors (weights, biases, scalars), lazy
     private readonly Dictionary<(int, int, int, int), VkBuffer> _constF16 = new();
@@ -217,12 +225,24 @@ internal sealed class GpuGraphModel
                 _pDw4A = Pipe("conv_dw4a", 6, 48);
             }
         }
-        else
+        else if (dev.Coop16x16x16)
         {
             _pConv1x1 = Pipe("conv1x1_cm", 6, 16, 16);
             _pConv1x1N64 = Pipe("conv1x1_cm_n64", 6, 16, 16);
             _pConv1x1N32 = Pipe("conv1x1_cm_n32", 6, 16, 16);
         }
+        else if (RouteNocm)
+        {
+            // subgroup-free GEMM. One tile; n64/n32 stay aliases so CmTile's
+            // sg16 cout split is not reused here.
+            _nocm = true;
+            _pConv1x1 = Pipe("gemm_nc", 6, 16);
+            _pConv1x1N64 = _pConv1x1;
+            _pConv1x1N32 = _pConv1x1;
+        }
+        else
+            throw new NotSupportedException(
+                "Vulkan: no 16x16x16 fp16 cooperative matrix");
         _pDot = Pipe("conv1x1_dot", 8, 28);
         _pDw = Pipe("conv_dw", 4, 48);
         _pDw4 = Pipe("conv_dw4", 4, 48);
@@ -860,7 +880,8 @@ internal sealed class GpuGraphModel
         // sg32: cout<=32 -> 128x32, cout<=64 -> 128x64, else 128x128
         // m/k > 0: a plain GEMM that may take the direct-load kernel (lite)
         (VkPipeline pipe, uint tm, uint tn) CmTile(int c, long m = 0, int k = 0) =>
-            _pCmD is not null && m >= 16 && k > 0 && k % 16 == 0
+            _nocm ? (_pConv1x1, 32u, 64u)
+            : _pCmD is not null && m >= 16 && k > 0 && k % 16 == 0
                 ? (c <= 32 ? (_pCmDN32!, 128u, 32u) : c <= 64 ? (_pCmDN64!, 128u, 64u) : (_pCmD, 128u, 128u))
             : _sg32 ? (c <= 32 ? (_pConv1x1N32, 128u, 32u)
                      : c <= 64 ? (_pConv1x1N64, 128u, 64u)
@@ -2210,8 +2231,9 @@ internal sealed class GpuGraphModel
                 Console.Error.WriteLine($"rec[{ri}] {recs[ri].Tag} gx={recs[ri].Gx} gy={recs[ri].Gy}");
 
         // device-independent, but the sg16 (Arc) kernel set has not been
-        // verified against packed slabs yet
-        if (_sg32) PackSlabs(recs, arena, off, slabElems, ref im2colOff);
+        // verified against packed slabs yet. The no-coopmat tile only binds
+        // slab starts, same as the sg32 GEMM, so packing is safe there too.
+        if (_sg32 || _nocm) PackSlabs(recs, arena, off, slabElems, ref im2colOff);
         // +128*512: coopmat A-tile reads pad rows past M
         long arenaElems = im2colOff + maxIm2col + 128 * 512 + (1L << 20);
         return new GpuSchedule

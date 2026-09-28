@@ -1,0 +1,157 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Conv1x1 / MatMul GEMM for devices with no cooperative matrix.
+//   OUT[M, N] = act(X[M, K] * W[N, K]^T + bias + residual)
+// fp16 in memory, fp32 accumulate in increasing K. No subgroup builtins.
+// A BM x BK / B BN x BK tile sits in shared memory as f16vec4 so each
+// K-step of 4 is one vector load. Bindings and the 16-byte push constant
+// match conv1x1_cm.
+//
+// flags: bit0 hasBias, bit1 hasResidual, bit3 dual output, bits[4:7] activation
+//   act: 0=none 1=relu 2=gelu 3=hardswish 4=sigmoid
+//   bit10 (1024): dual output stores the pre-activation value
+
+#ifndef BM
+#define BM 32u
+#endif
+#ifndef BN
+#define BN 64u
+#endif
+#ifndef BK
+#define BK 16u
+#endif
+#ifndef TM
+#define TM 4u
+#endif
+#ifndef TN
+#define TN 4u
+#endif
+
+#define NTX (BN / TN)
+#define NTY (BM / TM)
+#define NTHR (NTX * NTY)
+#define AK (BK / 4u)
+
+layout(local_size_x = NTHR) in;
+
+layout(set = 0, binding = 0) readonly buffer X { f16vec4 x[]; };
+layout(set = 0, binding = 1) readonly buffer W { f16vec4 w[]; };
+layout(set = 0, binding = 2) readonly buffer Bias { float16_t bias[]; };
+layout(set = 0, binding = 3) readonly buffer Res { float16_t res[]; };
+layout(set = 0, binding = 4) writeonly buffer O { float16_t o[]; };
+layout(set = 0, binding = 5) writeonly buffer O2 { float16_t o2[]; };
+
+layout(push_constant) uniform PC { uint mDim; uint nDim; uint kDim; uint flags; } p;
+
+shared f16vec4 As[(BM * BK) / 4u];
+shared f16vec4 Bs[(BN * BK) / 4u];
+
+float erf1(float v)
+{
+    float s = v < 0.0 ? -1.0 : 1.0;
+    v = abs(v);
+    float t = 1.0 / (1.0 + 0.47047 * v);
+    float q = t * (0.3480242 + t * (-0.0958798 + t * 0.7478556));
+    return s * (1.0 - q * exp(-v * v));
+}
+
+float16_t actf(float v, uint act, uint flg)
+{
+    if (act == 1u) return float16_t(max(v, 0.0));
+    if (act == 2u) return float16_t(0.5 * v * (1.0 + erf1(v * 0.70710678118654752)));
+    if (act == 3u) { float a = unpackHalf2x16(flg >> 16).x; float hs = clamp(v * a + 0.5, 0.0, 1.0); return float16_t(v * hs); }
+    if (act == 4u) return float16_t(1.0 / (1.0 + exp(-v)));
+    return float16_t(v);
+}
+
+float lane4(f16vec4 v, uint s)
+{
+    if (s == 0u) return float(v.x);
+    if (s == 1u) return float(v.y);
+    if (s == 2u) return float(v.z);
+    return float(v.w);
+}
+
+void main()
+{
+    uint tid = gl_LocalInvocationID.x;
+    uint tx = tid % NTX;
+    uint ty = tid / NTX;
+    uint m0 = gl_WorkGroupID.x * BM;
+    uint n0 = gl_WorkGroupID.y * BN;
+    uint kv = p.kDim >> 2u;
+
+    float acc[TM * TN];
+    for (uint i = 0u; i < TM * TN; i++) acc[i] = 0.0;
+
+    f16vec4 z = f16vec4(float16_t(0.0));
+    for (uint k0 = 0u; k0 < p.kDim; k0 += BK)
+    {
+        uint aVecs = BM * AK;
+        for (uint e = tid; e < aVecs; e += NTHR)
+        {
+            uint r = e / AK;
+            uint cv = e - r * AK;
+            uint gm = m0 + r;
+            uint gk = k0 + cv * 4u;
+            As[e] = (gm < p.mDim && gk < p.kDim) ? x[gm * kv + (gk >> 2u)] : z;
+        }
+        uint bVecs = BN * AK;
+        for (uint e = tid; e < bVecs; e += NTHR)
+        {
+            uint nLoc = e / AK;
+            uint cv = e - nLoc * AK;
+            uint gn = n0 + nLoc;
+            uint gk = k0 + cv * 4u;
+            Bs[e] = (gn < p.nDim && gk < p.kDim) ? w[gn * kv + (gk >> 2u)] : z;
+        }
+        barrier();
+        for (uint kk = 0u; kk < BK; kk += 4u)
+        {
+            f16vec4 av[TM];
+            f16vec4 bv[TN];
+            for (uint i = 0u; i < TM; i++)
+                av[i] = As[(ty * TM + i) * AK + (kk >> 2u)];
+            for (uint j = 0u; j < TN; j++)
+                bv[j] = Bs[(tx * TN + j) * AK + (kk >> 2u)];
+            for (uint s = 0u; s < 4u; s++)
+            {
+                float asv[TM];
+                float bsv[TN];
+                for (uint i = 0u; i < TM; i++) asv[i] = lane4(av[i], s);
+                for (uint j = 0u; j < TN; j++) bsv[j] = lane4(bv[j], s);
+                for (uint i = 0u; i < TM; i++)
+                    for (uint j = 0u; j < TN; j++)
+                        acc[i * TN + j] += asv[i] * bsv[j];
+            }
+        }
+        barrier();
+    }
+
+    uint act = (p.flags >> 4) & 7u;
+    bool hasBias = (p.flags & 1u) != 0u;
+    bool hasRes = (p.flags & 2u) != 0u;
+    bool dual = (p.flags & 8u) != 0u;
+    bool dualRaw = (p.flags & 1024u) != 0u;
+    uint mBase = m0 + ty * TM;
+    uint nBase = n0 + tx * TN;
+    for (uint i = 0u; i < TM; i++)
+    {
+        uint gm = mBase + i;
+        if (gm >= p.mDim) continue;
+        for (uint j = 0u; j < TN; j++)
+        {
+            uint gn = nBase + j;
+            if (gn >= p.nDim) continue;
+            float v = acc[i * TN + j];
+            if (hasBias) v += float(bias[gn]);
+            if (hasRes) v += float(res[gm * p.nDim + gn]);
+            o[gm * p.nDim + gn] = actf(v, act, p.flags);
+            if (dual)
+                o2[gm * p.nDim + gn] = dualRaw ? float16_t(v) : actf(v, 2u, p.flags);
+        }
+    }
+}

@@ -47,3 +47,6 @@ echo glslc sg32l / sg32d variants
 "%GLSLC%" -O --target-env=vulkan1.1 -DDIRECT %N32% "%SG32%" -o "%DIR%\conv1x1_cm_sg32d_n32.spv" || exit /b 1
 rem flat depthwise with the addps absorb read (sg32l k<=3)
 "%GLSLC%" -O --target-env=vulkan1.1 -DABSORB "%DIR%\conv_dw4.comp" -o "%DIR%\conv_dw4a.spv" || exit /b 1
+rem nocm: subgroup-free fp16 GEMM (devices without 16x16x16 coopmat)
+echo glslc gemm_nc
+"%GLSLC%" -O --target-env=vulkan1.1 "%DIR%\gemm_nc.comp" -o "%DIR%\gemm_nc.spv" || exit /b 1
