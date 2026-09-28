@@ -2,7 +2,7 @@
 
 实测机：Intel UHD Graphics 770（Xe-LP，32 EU，核显最大动态频率 1.55 GHz），与 CPU 共享内存。驱动 101.7079（Vulkan API 1.4.323）。Windows，电源计划「高性能」。.NET SDK 11.0.100-rc.1 编译 `net10.0`。`test/Sdcb.SimdPaddleOCR.Tests`，`--workers 4 --benchmark-kind simd --warmup 1`，同一 `dataset/` 100 张，墙钟 n=99。
 
-**结论：没有 16×16×16 fp16 协作矩阵。无矩阵 GEMM 调优一轮后，三档端到端比上一版快 13–34%（medium 1623 → 1073 ms），但仍慢于同机 sharp（约 1.3× / 1.7× / 1.9×）。默认仍在建会话时退回 CPU，不编译协作矩阵 shader（Intel 编译器会把进程直接打掉）。sg16 / sg32 / sg32l 的 shader、spv 和路由没改。**
+**结论：没有 16×16×16 fp16 协作矩阵。无矩阵 GEMM 调优一轮后，三档端到端比上一版快 13–34%（medium 1623 → 1073 ms），但仍慢于同机 sharp（约 1.3× / 1.7× / 1.9×）。所以 `Auto` 在这种设备上走 CPU，只有显式指定 `OcrBackend.Vulkan`（或 `Auto` + `SIMD_OCR_BACKEND=vulkan`）才走这条 GPU 路径。两种情况都不编译协作矩阵 shader（Intel 编译器会把进程直接打掉）。sg16 / sg32 / sg32l 的 shader、spv 和路由没改。**
 
 ## 设备能力
 
@@ -36,11 +36,11 @@
 
 `PackSlabs` 只在这条档上额外打开，`_sg32` 的条件没动。kxk 仍是 `convk_dot` / im2col，门槛没改（见下文放弃项）。
 
-`GpuGraphModel.RouteNocm` 为 false。没有这种协作矩阵时，构造函数在创建任何管线之前抛 `NotSupportedException`，`GpuBackend.CreateSession` 接住后用 CPU。指定 `OcrBackend.Vulkan` 在这台机器上因此仍是 CPU。
+选路在 `GpuBackend.UsesGpu`：设备没有 `Coop16x16x16` 时，只有显式选了 Vulkan 才建 GPU 会话，`Auto` 直接给 CPU 会话。`OcrSessionFactory.IsGpuBackend` 用同一个谓词，所以 `Auto` 在这里也按 CPU 的方式分批（之前它只看"设备探测成功"，会给 CPU 会话配上 GPU 的 16 行识别批）。`GpuGraphModel` 只看能力：没有 `Coop16x16x16` 就建 `gemm_nc` / `gemm_nc_s`，不碰任何 cm 管线。
 
 ## 端到端（4 workers，median ms/图）
 
-同一时段三方交替 3 轮：上一版（`67852e0` 临时打开 `RouteNocm`）、本版（同样临时打开）、sharp。第 1、3 轮的 sharp 被机器上别的负载干扰（small 302 / 269、medium 1138），CPU 只取干净的第 2 轮（medium 第 3 轮 561 也干净）。
+同一时段三方交替 3 轮：上一版（`67852e0` 临时打开当时的 `RouteNocm` 开关）、本版（`--engine vulkan`）、sharp。第 1、3 轮的 sharp 被机器上别的负载干扰（small 302 / 269、medium 1138），CPU 只取干净的第 2 轮（medium 第 3 轮 561 也干净）。
 
 | 模型 | sharp | 上一版 Vulkan（3 轮） | 本版 Vulkan（3 轮） | 本版 / sharp |
 |---|---:|---|---|---:|
@@ -121,6 +121,10 @@ GEMM（`--rawbench`，SIMD8，GEMM 形状集总和；同一时段内比较）：
 
 ## 默认路径
 
-三档都没有快过同机 sharp，`RouteNocm` 保持 false。内核、两个 spv 和路由留在树里。统一内存上的 `preferHost` 修正是一直生效的：先仍选非 device-local 的主机缓存类型（独显走这里），只有选不中时才接受 device-local + host-cached。
+三档都没有快过同机 sharp，所以 `Auto` 不走这条路径。显式 `Vulkan` 走：结果和 CPU 精度一致，只是慢 1.3–1.9 倍。tiny 上实测：`--engine vulkan` 86.9 ms，`--engine auto` 55.1 ms（与 sharp 逐图 100/100），`auto` + `SIMD_OCR_BACKEND=vulkan` 83.9 ms（与 vulkan 100/100）。
 
-没有改 sg16 / sg32 / sg32l 的 shader、spv 或选择条件，新增的判断都挂在 `_nocm` 上（只在 `RouteNocm` 为 true 且没有 `Coop16x16x16` 时置位）。全量重编后其余 `.spv` 逐字节不变。B580、3080 Ti、880M 上不需要为这次改动复测。
+没有 coopmat、subgroup 固定为 32 的设备（例如不带协作矩阵的旧 NVIDIA）以前在 sg32 分支里抛异常回 CPU，现在显式 `Vulkan` 也会进这条无矩阵档。内核不依赖 subgroup 宽度，结果应该正确，但没有在这类设备上测过；锁不了 8 lane 时由驱动选宽度，可能溢出而很慢。
+
+统一内存上的 `preferHost` 修正是一直生效的：先仍选非 device-local 的主机缓存类型（独显走这里），只有选不中时才接受 device-local + host-cached。
+
+没有改 sg16 / sg32 / sg32l 的 shader、spv 或选择条件，新增的判断都挂在 `_nocm` 上（没有 `Coop16x16x16` 时置位），`UsesGpu` 对有 `Coop16x16x16` 的设备与原来的条件相同。全量重编后其余 `.spv` 逐字节不变。B580、3080 Ti、880M 上不需要为这次改动复测。

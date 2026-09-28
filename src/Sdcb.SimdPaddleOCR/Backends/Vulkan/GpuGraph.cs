@@ -79,16 +79,12 @@ internal sealed class GpuGraphModel
     // sg32 lite family only: direct-load plain GEMM (M >= 16, K % 16 == 0)
     private readonly VkPipeline? _pCmD, _pCmDN64, _pCmDN32, _pDw4A;
     private readonly bool _lite;
-    private bool _nocm;
+    // No 16×16×16 coopmat: subgroup-free gemm_nc instead of every cm pipe
+    // (Intel's compiler aborts the process on those shaders). Sessions only
+    // reach this for an explicit OcrBackend.Vulkan — GpuBackend.UsesGpu.
+    private readonly bool _nocm;
     // gemm_nc built with the unrolled no-act / relu / hardswish, single-output tail
     private readonly VkPipeline? _pGemmNcS;
-    // No 16×16×16 coopmat. The kernel is in gemm_nc.comp; the route stays
-    // off. UHD 770 medians (docs/vulkan-uhd770.md): tiny 89 vs
-    // 68 ms, small 248 vs 147, medium 1091 vs 563, all slower than sharp.
-    // false: throw before any coopmat SPIR-V is compiled — Intel's compiler
-    // aborts the process on those shaders — so Vulkan/Auto fall back to CPU
-    // at session creation.
-    private static readonly bool RouteNocm = false;
 
     // fp16 copies of constant tensors (weights, biases, scalars), lazy
     private readonly Dictionary<(int, int, int, int), VkBuffer> _constF16 = new();
@@ -192,10 +188,22 @@ internal sealed class GpuGraphModel
         _dev = dev;
         _compiled = compiled;
         _model = compiled.Model;
+        _nocm = !dev.Coop16x16x16;
         // sg16-only coopmat shaders: NVIDIA (sg 32-32) and AMD wave64 cannot
         // satisfy requiredSubgroupSize=16 — swap in the sg32 variant.
-        _sg32 = dev.SubgroupMin > 16 && dev.SubgroupMax >= 32;
-        if (_sg32)
+        _sg32 = !_nocm && dev.SubgroupMin > 16 && dev.SubgroupMax >= 32;
+        if (_nocm)
+        {
+            // One tile; n64/n32 stay aliases so CmTile's sg16 cout split is
+            // not reused here. 8 lanes keep its 64 fp32 accumulators in
+            // registers (UHD 770: SIMD16 spills, 4x slower).
+            bool sg8 = dev.ComputeSubgroupSize && dev.SubgroupMin <= 8 && dev.SubgroupMax >= 8;
+            _pConv1x1 = Pipe("gemm_nc", 6, 16, sg8 ? 8u : 0u);
+            _pGemmNcS = Pipe("gemm_nc_s", 6, 16, sg8 ? 8u : 0u);
+            _pConv1x1N64 = _pConv1x1;
+            _pConv1x1N32 = _pConv1x1;
+        }
+        else if (_sg32)
         {
             // the sg32 lane mapping is hard-wired: without a pinned 32-lane
             // compute subgroup (a wave64 default) or the 16x16x16 fp16 MMA
@@ -227,27 +235,12 @@ internal sealed class GpuGraphModel
                 _pDw4A = Pipe("conv_dw4a", 6, 48);
             }
         }
-        else if (dev.Coop16x16x16)
+        else
         {
             _pConv1x1 = Pipe("conv1x1_cm", 6, 16, 16);
             _pConv1x1N64 = Pipe("conv1x1_cm_n64", 6, 16, 16);
             _pConv1x1N32 = Pipe("conv1x1_cm_n32", 6, 16, 16);
         }
-        else if (RouteNocm)
-        {
-            // subgroup-free GEMM. One tile; n64/n32 stay aliases so CmTile's
-            // sg16 cout split is not reused here. 8 lanes keep its 64 fp32
-            // accumulators in registers (UHD 770: SIMD16 spills, 4x slower).
-            _nocm = true;
-            bool sg8 = dev.ComputeSubgroupSize && dev.SubgroupMin <= 8 && dev.SubgroupMax >= 8;
-            _pConv1x1 = Pipe("gemm_nc", 6, 16, sg8 ? 8u : 0u);
-            _pGemmNcS = Pipe("gemm_nc_s", 6, 16, sg8 ? 8u : 0u);
-            _pConv1x1N64 = _pConv1x1;
-            _pConv1x1N32 = _pConv1x1;
-        }
-        else
-            throw new NotSupportedException(
-                "Vulkan: no 16x16x16 fp16 cooperative matrix");
         _pDot = Pipe("conv1x1_dot", 8, 28);
         _pDw = Pipe("conv_dw", 4, 48);
         _pDw4 = Pipe("conv_dw4", 4, 48);
