@@ -39,7 +39,6 @@ internal sealed class GpuSchedule
 /// <summary>Streamed-run callback: units [first, first+count) of result
 /// (unit i at offsets[i]) are complete. Return false to stop receiving
 /// further batches.</summary>
-internal delegate bool GpuUnitsReady(float[] result, int[] offsets, int first, int count);
 
 /// <summary>
 /// Per-session GPU runtime over a shared <see cref="GpuGraphModel"/>: owns
@@ -50,7 +49,7 @@ internal delegate bool GpuUnitsReady(float[] result, int[] offsets, int first, i
 /// contend beyond the queue-submit lock — CPU work of concurrent sessions
 /// (upload, record, readback) overlaps freely.
 /// </summary>
-internal sealed unsafe class GpuDetGraph : IDisposable
+internal sealed unsafe class GpuDetGraph : IOcrGraphRunner
 {
     private readonly VkDevice _dev;
     private readonly GpuGraphModel _model;
@@ -128,7 +127,7 @@ internal sealed unsafe class GpuDetGraph : IDisposable
     /// submission has completed by the time this returns or throws.
     /// </summary>
     public bool RunMany(IReadOnlyList<int[]> shapes, ReadOnlySpan<float> input,
-        int nodeLimit, int outTensor, GpuUnitsReady onReady)
+        int nodeLimit, int outTensor, CtcUnitsReady onReady)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         var sched = new GpuSchedule[shapes.Count];
@@ -145,7 +144,7 @@ internal sealed unsafe class GpuDetGraph : IDisposable
     private static long Align64(long floats) => (floats + 63) & ~63L;
 
     private float[] RunCore(GpuSchedule[] sched, ReadOnlySpan<float> input, out int[] outOffsets,
-        GpuUnitsReady? sink = null)
+        CtcUnitsReady? sink = null)
     {
         long t0 = Stopwatch.GetTimestamp();
         int n = sched.Length;

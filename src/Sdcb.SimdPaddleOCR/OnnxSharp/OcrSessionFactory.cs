@@ -25,7 +25,7 @@ internal static class OcrSessionFactory
     {
 #if NET10_0_OR_GREATER
         if (Backends.Metal.MetalBackend.IsMetalSelected(backend))
-            return Backends.Metal.MetalBackend.TryGetDevice() is not null;
+            return Backends.Metal.MetalBackend.UsesGpu(backend);
         return Backends.Vulkan.GpuBackend.UsesGpu(backend);
 #else
         _ = backend;

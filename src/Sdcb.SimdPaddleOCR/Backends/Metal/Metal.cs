@@ -12,19 +12,23 @@ namespace Sdcb.SimdPaddleOCR.Backends.Metal;
 // is CPU- and GPU-visible without didModifyRange/coherence calls.
 internal static class MtlStorageMode { public const nuint Shared = 0; }
 
-// MTLDataType values (MTLDataType.h)
+// MTLDataType values (MTLDataType.h) — only what NewPipeline's intConstants
+// path uses.
 internal static class MtlDataType
 {
-    public const nuint Float = 3;
     public const nuint Int = 29;
-    public const nuint UInt = 30;
-    public const nuint Bool = 53;
 }
 
 internal sealed class MtlDevice : IDisposable
 {
     public readonly IntPtr H;
     private readonly IntPtr _queue;
+    // OCR shader library + PSO cache, shared by every MetalGraphModel on this
+    // device (each PaddleOcrAll carries det/cls/rec models — per-model
+    // libraries would recompile ~2.5k lines of MSL three times and leak the
+    // whole set on every release). Disposed with the device.
+    private MtlLibrary? _ocrLib;
+    private readonly Dictionary<string, MtlPipeline> _ocrPipes = new();
 
     private MtlDevice(IntPtr h)
     {
@@ -67,10 +71,41 @@ internal sealed class MtlDevice : IDisposable
     {
         if (!OperatingSystem.IsMacOS()) return null;
         using var pool = AutoReleasePool.Create();
+        // MTLCreateSystemDefaultDevice follows the Create rule: already +1.
         IntPtr h = ObjC.CreateSystemDefaultDevice();
-        if (h == 0) return null;
-        ObjC.Retain(h); // C-function result is autoreleased; promote to +1.
-        return new MtlDevice(h);
+        return h == 0 ? null : new MtlDevice(h);
+    }
+
+    /// <summary>Pipeline for a kernel in the embedded OCR shader library,
+    /// compiled once and cached per device.</summary>
+    internal MtlPipeline OcrPipe(string name)
+    {
+        lock (_ocrPipes)
+        {
+            if (!_ocrPipes.TryGetValue(name, out MtlPipeline? p))
+                _ocrPipes[name] = p = NewPipeline(OcrLibrary(), name);
+            return p;
+        }
+    }
+
+    private MtlLibrary OcrLibrary()
+    {
+        if (_ocrLib is not null) return _ocrLib;
+        var asm = typeof(MtlDevice).Assembly;
+        var names = asm.GetManifestResourceNames()
+            .Where(n => n.StartsWith("Sdcb.SimdPaddleOCR.Backends.Metal.Shaders.")
+                        && n.EndsWith(".metal"))
+            .OrderBy(n => n).ToArray();
+        if (names.Length == 0)
+            throw new FileNotFoundException("Metal: no embedded .metal shaders");
+        var sb = new System.Text.StringBuilder();
+        foreach (var n in names)
+        {
+            using Stream s = asm.GetManifestResourceStream(n)!;
+            using var r = new StreamReader(s);
+            sb.AppendLine(r.ReadToEnd());
+        }
+        return _ocrLib = NewLibrary(sb.ToString());
     }
 
     public MtlBuffer NewBuffer(nuint bytes)
@@ -182,6 +217,12 @@ internal sealed class MtlDevice : IDisposable
 
     public void Dispose()
     {
+        lock (_ocrPipes)
+        {
+            foreach (MtlPipeline p in _ocrPipes.Values) p.Dispose();
+            _ocrPipes.Clear();
+        }
+        _ocrLib?.Dispose();
         ObjC.Release(_queue);
         ObjC.Release(H);
     }

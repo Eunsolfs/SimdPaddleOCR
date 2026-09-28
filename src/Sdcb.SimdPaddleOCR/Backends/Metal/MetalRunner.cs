@@ -40,18 +40,18 @@ internal sealed class MetalSchedule
 /// <summary>Streamed-run callback: units [first, first+count) of result
 /// (unit i at offsets[i]) are complete. Return false to stop receiving
 /// further batches.</summary>
-internal delegate bool MetalUnitsReady(float[] result, int[] offsets, int first, int count);
 
 /// <summary>
 /// Per-session Metal runtime over a shared <see cref="MetalGraphModel"/>:
 /// owns the fp16 arena, fp32 input/output buffers and the partials scratch —
 /// all Shared-mode (unified memory: the CPU writes/reads the same mapping,
 /// no staging copies). Each run re-records one command buffer per wave from
-/// the pure-managed schedule; dispatches go through a serial compute encoder
-/// with a memory barrier after each rec (the schedule's correctness relies
-/// on strict ordering just like the Vulkan per-rec barrier).
+/// the pure-managed schedule; single-unit runs go through a serial compute
+/// encoder (implicit ordering, no barriers needed), while interleaved
+/// multi-unit runs use a concurrent encoder with one buffer barrier per
+/// level — the Vulkan runner's per-rec pipeline barrier equivalent.
 /// </summary>
-internal sealed unsafe class MetalDetGraph : IDisposable
+internal sealed unsafe class MetalDetGraph : IOcrGraphRunner
 {
     private readonly MtlDevice _dev;
     private readonly MetalGraphModel _model;
@@ -105,7 +105,7 @@ internal sealed unsafe class MetalDetGraph : IDisposable
     /// submission has completed by the time this returns or throws.
     /// </summary>
     public bool RunMany(IReadOnlyList<int[]> shapes, ReadOnlySpan<float> input,
-        int nodeLimit, int outTensor, MetalUnitsReady onReady)
+        int nodeLimit, int outTensor, CtcUnitsReady onReady)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         var sched = new MetalSchedule[shapes.Count];
@@ -121,7 +121,7 @@ internal sealed unsafe class MetalDetGraph : IDisposable
     private static long Align64(long floats) => (floats + 63) & ~63L;
 
     private float[] RunCore(MetalSchedule[] sched, ReadOnlySpan<float> input,
-        out int[] outOffsets, MetalUnitsReady? sink = null)
+        out int[] outOffsets, CtcUnitsReady? sink = null)
     {
         long t0 = Stopwatch.GetTimestamp();
         int n = sched.Length;
@@ -190,9 +190,12 @@ internal sealed unsafe class MetalDetGraph : IDisposable
                 IntPtr cmd;
                 using (var pool = AutoReleasePool.Create())
                 {
-                    // Serial encoder: dispatches run in order; one device-scope
-                    // barrier per level/rec mirrors the Vulkan pipeline barrier.
-                    MtlEncoder enc = _dev.BeginCommands();
+                    // Interleave needs a concurrent encoder — under a serial
+                    // encoder dispatches already run in order, so a per-rec
+                    // barrier would be a no-op and the level overlap the whole
+                    // point of interleaving is unreachable. Concurrent +
+                    // one buffer barrier per level restores both.
+                    MtlEncoder enc = _dev.BeginCommands(concurrent: interleave);
                     cmd = enc.Cmd;
                     // +1 on the command buffer so it survives the pool drain
                     // while we wait below.
@@ -311,8 +314,7 @@ internal sealed unsafe class MetalDetGraph : IDisposable
         int alloc = Math.Max(units, _partUnits * 3 / 2);
         _part?.Dispose();
         _part = null;
-        // newBuffer is zero-initialised on Metal: se_fused ticket counters
-        // start at 0 and self-reset after each run.
+        // se partial-sum scratch; contents are fully rewritten per run.
         _part = _dev.NewBuffer((nuint)alloc * MetalGraphModel.PartBytes);
         _partUnits = alloc;
     }
@@ -365,11 +367,9 @@ internal sealed unsafe class MetalDetGraph : IDisposable
     private void RecordRecs(MtlEncoder enc, IReadOnlyList<MetalRec> recs,
         ref MtlPipeline? bound, ulong inBase, ulong outBase)
     {
+        // serial encoder: dispatch order is the dependency order.
         foreach (MetalRec r in recs)
-        {
             RecordOne(enc, r, ref bound, inBase, outBase, 0, 0);
-            if (!s_noBar) enc.BarrierBuffers();
-        }
     }
 
     private void RecordOne(MtlEncoder enc, MetalRec r, ref MtlPipeline? bound,

@@ -6,10 +6,9 @@ using Sdcb.SimdPaddleOCR.OnnxSharp;
 namespace Sdcb.SimdPaddleOCR.Backends.Metal;
 
 /// <summary>
-/// <summary>
-/// Metal counterpart of the Metal MetalGraphModel: shared per (device,
-/// compiled model); owns the embedded-MSL library pipelines, fp16 weight
-/// uploads and the graph compiler that emits a <see cref="MetalSchedule"/>
+/// Metal counterpart of the Vulkan GpuGraphModel: shared per (device,
+/// compiled model); owns the fp16 weight uploads and the graph compiler that
+/// emits a <see cref="MetalSchedule"/>
 /// — pure managed metadata (pipeline, arena-relative binding offsets, push
 /// constants, grid), no Metal object per shape. Sessions
 /// (<see cref="MetalDetGraph"/>) own the grow-only arena/IO buffers and
@@ -70,8 +69,9 @@ internal sealed class MetalGraphModel
         _pResize, _pResize4, _pResize4Add, _pConcat, _pConcat4, _pNchw, _pOut, _pIm2col,
         _pAddPs, _pSePart, _pSeJoin, _pConvD, _pConvDF32, _pCatRes,
         _pAvg4, _pAffine, _pLn, _pAttn, _pDotSk;
-    // Flat (unstaged) depthwise — threadgroup staging buys nothing on this
-    // unified-memory GPU; SIMD_OCR_NODWA=1 keeps the tiled variant for A/B.
+    // Flat (unstaged) depthwise — opt-in only: measured slower than
+    // conv_dw4t on this GPU (staging still pays off), SIMD_OCR_DWA enables it
+    // for A/B.
     private readonly MtlPipeline? _pDw4A;
 
     // fp16 copies of constant tensors (weights, biases, scalars), lazy
@@ -180,60 +180,58 @@ internal sealed class MetalGraphModel
         _dev = dev;
         _compiled = compiled;
         _model = compiled.Model;
-        _lib = LoadLibrary();
 
         // one probe per capability tier: the simdgroup-matrix kernels get a
         // PSO + smoke dispatch; failure downgrades the cm paths to the
         // portable dot kernels (correct, just slower).
         _sgm = ProbeSimdMatrix();
-        _pMm = Pipe("mm_sg");
-        _pMmPs = Pipe("mm_ps_sg");
-        _pMmDot = Pipe("mm_dot");           // portable cm-path fallback
-        _pMmDd = Pipe("mm_sg_dd");           // direct fragment loads, no staging
-        _pMmIc = Pipe("mm_ic_sg");           // implicit-GEMM kxk conv (tap gather in A stage)
+        _pMm = _dev.OcrPipe("mm_sg");
+        _pMmPs = _dev.OcrPipe("mm_ps_sg");
+        _pMmDot = _dev.OcrPipe("mm_dot");           // portable cm-path fallback
+        _pMmDd = _dev.OcrPipe("mm_sg_dd");           // direct fragment loads, no staging
+        _pMmIc = _dev.OcrPipe("mm_ic_sg");           // implicit-GEMM kxk conv (tap gather in A stage)
         _pMmIc32 = Environment.GetEnvironmentVariable("SIMD_OCR_IC32") != null
-            ? Pipe("mm_ic_sg32") : _pMmIc; // measured: BK=32 loses except det-medium
+            ? _dev.OcrPipe("mm_ic_sg32") : _pMmIc; // measured: BK=32 loses except det-medium
         if (!_sgm) { _pMm = _pMmDot; _pMmPs = _pMmDot; _pMmDd = _pMmDot; _pMmIc = _pMmDot; _pMmIc32 = _pMmDot; }
 
-        _pDot = Pipe("conv1x1_dot");
-        _pDw = Pipe("conv_dw");
-        _pDw4 = Pipe("conv_dw4");
-        _pDw4T = Pipe("conv_dw4t");
+        _pDot = _dev.OcrPipe("conv1x1_dot");
+        _pDw = _dev.OcrPipe("conv_dw");
+        _pDw4 = _dev.OcrPipe("conv_dw4");
+        _pDw4T = _dev.OcrPipe("conv_dw4t");
         _pDw4A = Environment.GetEnvironmentVariable("SIMD_OCR_DWA") != null
-            ? Pipe("conv_dw4a") : null;   // measured: flat loses to conv_dw4t
-        _pDense = Pipe("conv_dense");
-        _pIm2col = Pipe("im2col");
-        _pConvT = Pipe("convt2s2");
-        _pConvT4 = Pipe("convt4");
-        _pReduce4 = Pipe("reduce_hw4");
-        _pReduce4b = Pipe("reduce_hw4b");
-        _pPool4 = Pipe("maxpool4");
-        _pResize4 = Pipe("resize4");
-        _pResize4Add = Pipe("resize4add");
-        _pConcat4 = Pipe("concat4");
-        _pCatRes = Pipe("catresize");
-        _pElem = Pipe("elem");
-        _pElem4 = Pipe("elem4");
-        _pAddPs = Pipe("addps");
-        _pSePart = Pipe("se_part");
-        _pSeJoin = Pipe("se_join");
-        _pConvD = Pipe("convk_dot");
-        _pConvDF32 = Pipe("convk_f32n");
-        _pReduce = Pipe("reduce_hw");
-        _pPool = Pipe("maxpool2e");
-        _pResize = Pipe("resize_nn");
-        _pConcat = Pipe("concat_c");
-        _pNchw = Pipe("nchw2nhwc");
-        _pOut = Pipe("sigmoid_out");
-        _pAvg4 = Pipe("avgpool4");
-        _pAffine = Pipe("affine4");
-        _pSoftmax = Pipe("softmax");
-        _pLn = Pipe("layernorm");
-        _pAttn = Pipe("attn");
-        _pDotSk = Pipe("mmdot_sk");
+            ? _dev.OcrPipe("conv_dw4a") : null;   // measured: flat loses to conv_dw4t
+        _pDense = _dev.OcrPipe("conv_dense");
+        _pIm2col = _dev.OcrPipe("im2col");
+        _pConvT = _dev.OcrPipe("convt2s2");
+        _pConvT4 = _dev.OcrPipe("convt4");
+        _pReduce4 = _dev.OcrPipe("reduce_hw4");
+        _pReduce4b = _dev.OcrPipe("reduce_hw4b");
+        _pPool4 = _dev.OcrPipe("maxpool4");
+        _pResize4 = _dev.OcrPipe("resize4");
+        _pResize4Add = _dev.OcrPipe("resize4add");
+        _pConcat4 = _dev.OcrPipe("concat4");
+        _pCatRes = _dev.OcrPipe("catresize");
+        _pElem = _dev.OcrPipe("elem");
+        _pElem4 = _dev.OcrPipe("elem4");
+        _pAddPs = _dev.OcrPipe("addps");
+        _pSePart = _dev.OcrPipe("se_part");
+        _pSeJoin = _dev.OcrPipe("se_join");
+        _pConvD = _dev.OcrPipe("convk_dot");
+        _pConvDF32 = _dev.OcrPipe("convk_f32n");
+        _pReduce = _dev.OcrPipe("reduce_hw");
+        _pPool = _dev.OcrPipe("maxpool2e");
+        _pResize = _dev.OcrPipe("resize_nn");
+        _pConcat = _dev.OcrPipe("concat_c");
+        _pNchw = _dev.OcrPipe("nchw2nhwc");
+        _pOut = _dev.OcrPipe("sigmoid_out");
+        _pAvg4 = _dev.OcrPipe("avgpool4");
+        _pAffine = _dev.OcrPipe("affine4");
+        _pSoftmax = _dev.OcrPipe("softmax");
+        _pLn = _dev.OcrPipe("layernorm");
+        _pAttn = _dev.OcrPipe("attn");
+        _pDotSk = _dev.OcrPipe("mmdot_sk");
     }
 
-    private readonly MtlLibrary _lib;
     private readonly bool _sgm;   // simdgroup_matrix 8x8 fp16 MMA verified live
     // sg32-family fields kept for emit parity with the Vulkan schedule
     // (DwTiled uses the sg32 kernel cap; PackSlabs runs unconditionally here)
@@ -241,36 +239,19 @@ internal sealed class MetalGraphModel
     private readonly bool _lite = false;
     private readonly MtlPipeline _pMm, _pMmPs, _pMmDot, _pMmDd, _pMmIc, _pMmIc32;
 
-    // Concatenated .metal sources embedded as manifest resources, sorted so
-    // a_common.metal's helpers come first.
-    private MtlLibrary LoadLibrary()
-    {
-        var asm = typeof(MetalGraphModel).Assembly;
-        var names = asm.GetManifestResourceNames()
-            .Where(n => n.StartsWith("Sdcb.SimdPaddleOCR.Backends.Metal.Shaders.")
-                        && n.EndsWith(".metal"))
-            .OrderBy(n => n).ToArray();
-        if (names.Length == 0)
-            throw new FileNotFoundException("Metal: no embedded .metal shaders");
-        var sb = new System.Text.StringBuilder();
-        foreach (var n in names)
-        {
-            using Stream s = asm.GetManifestResourceStream(n)!;
-            using var r = new StreamReader(s);
-            sb.AppendLine(r.ReadToEnd());
-        }
-        return _dev.NewLibrary(sb.ToString());
-    }
-
     /// <summary>PSO + live correctness smoke for simdgroup_matrix kernels:
     /// a PSO that links is not proof the driver executes it — the probe runs
-    /// a 64x64 tile GEMM against a canned input and compares one element.
+    /// a 64x64 tile GEMM against a canned input and compares the whole tile.
+    /// The kernel assumes 8 32-lane simdgroups (256 threads), so the PSO
+    /// geometry is gated too.
     /// </summary>
     private unsafe bool ProbeSimdMatrix()
     {
         try
         {
-            MtlPipeline p = _dev.NewPipeline(_lib, "mm_sg");
+            MtlPipeline p = _dev.OcrPipe("mm_sg");
+            if (p.ThreadExecutionWidth != 32 || p.MaxTotalThreadsPerThreadgroup < 256)
+                return false;
             const int M = 64, N = 64, K = 16;
             var a = new Half[M * K]; var w = new Half[N * K];
             var rnd = new Random(1234);
@@ -296,24 +277,19 @@ internal sealed class MetalGraphModel
                     e.End(); e.CommitAndWait();
                 }
             }
-            // verify a corner element: o[0,0] = sum_k a[0,k]*w[0,k]
-            float expect = 0;
-            for (int k = 0; k < K; k++) expect += (float)a[k] * (float)w[k];
-            float got = (float)*(Half*)ob.Contents;
-            return MathF.Abs(got - expect) <= 0.05f * MathF.Max(1, MathF.Abs(expect));
+            // whole-tile compare: o[m,n] = sum_k a[m,k]*w[n,k] (w is n-major)
+            Half* got = (Half*)ob.Contents;
+            for (int m = 0; m < M; m++)
+                for (int n = 0; n < N; n++)
+                {
+                    float expect = 0;
+                    for (int k = 0; k < K; k++) expect += (float)a[m * K + k] * (float)w[n * K + k];
+                    if (MathF.Abs((float)got[m * N + n] - expect) > 0.05f * MathF.Max(1, MathF.Abs(expect)))
+                        return false;
+                }
+            return true;
         }
         catch { return false; }
-    }
-
-    private readonly Dictionary<string, MtlPipeline> _pipes = new();
-    private MtlPipeline Pipe(string name)
-    {
-        if (!_pipes.TryGetValue(name, out MtlPipeline? p))
-        {
-            p = _dev.NewPipeline(_lib, name);
-            _pipes[name] = p;
-        }
-        return p;
     }
 
     // constant upload helpers (Shared-mode buffers: contents is a plain
@@ -1436,21 +1412,15 @@ internal sealed class MetalGraphModel
                         // im2col-free direct conv: tap addressing inline in the
                         // dot kernel; skips materializing the K-expanded matrix.
                         // batched graphs always take it: the im2col fallback is batch-free
-                        // sg32: implicit-GEMM coopmat conv instead (same tap
-                        // addressing, tensor cores; any K, batched or not)
-                        // Metal has no implicit-GEMM kxk kernel: the dot
-                        // path covers every case (batched or K<=1024); the
-                        // rest falls to im2col + mm below.
-                        bool convkCm = false;
-                        if (convkCm || (cout % 4 == 0 && scalarBias == 0 && cinIn % 4 == 0
+                        if (cout % 4 == 0 && scalarBias == 0 && cinIn % 4 == 0
                             && (nb > 1 || Kp <= (Environment.GetEnvironmentVariable(
                                 "SIMD_OCR_CONVD_KMAX") is string km
                                 ? int.Parse(km) : 1024))
-                            && Environment.GetEnvironmentVariable("SIMD_OCR_NODCONV") == null))
+                            && Environment.GetEnvironmentVariable("SIMD_OCR_NODCONV") == null)
                         {
                             // stem conv on the fp32 NCHW input: skip nchw2nhwc
                             // when this is the sole consumer of the graph input
-                            bool f32In = !convkCm && inT == inIdx && cinIn == 4 && cin <= 4
+                            bool f32In = inT == inIdx && cinIn == 4 && cin <= 4
                                 && Environment.GetEnvironmentVariable(
                                     "SIMD_OCR_NOF32IN") == null;
                             if (f32In && (consumers[inIdx]?.Count ?? 0) == 1)
@@ -1492,9 +1462,11 @@ internal sealed class MetalGraphModel
                                 Emit(_pMmIc32, $"icconv n{ni} {M}x{Kp}x{cout}",
                                     [(arena, SlotOf(node.Inputs[0]), 2),
                                      (wic, 0, 2),
-                                     (biasBuf, 0, 2), (arena, 0, 2),
+                                     (biasBuf, 0, 2),
+                                     (arena, resT != uint.MaxValue ? SlotOf(resT) : 0, 2),
                                      (arena, off[outPhys], 2),
-                                     (arena, 0, 2), (arena, 0, 2)],
+                                     (arena, dualT != uint.MaxValue ? SlotOf(dualT) : 0, 2),
+                                     (arena, 0, 2)],
                                     [M, (uint)cout, (uint)Kp, (uint)(Kp / 4),
                                      flags, 0u, 0u,
                                      (uint)outW, (uint)inW, (uint)inH,
@@ -1525,7 +1497,10 @@ internal sealed class MetalGraphModel
                                 Div256(((M + 3) / 4) * (long)(cout / 4)),
                                 (uint)nb);
                         }
-                        else if (_sgm && !_noIc && cinIn % 4 == 0 && nb == 1)
+                        // scalarBias shares flags bit3 with the mm kernels'
+                        // dual-write — the ic epilogue would write o2 garbage.
+                        else if (_sgm && !_noIc && scalarBias == 0
+                            && cinIn % 4 == 0 && nb == 1)
                         {
                             // implicit-GEMM conv: mm_ic_sg gathers A through
                             // tap-major im2col addressing inside the staging
@@ -1535,9 +1510,11 @@ internal sealed class MetalGraphModel
                             Emit(_pMmIc32, $"icconv n{ni} {M}x{Kp}x{cout}",
                                 [(arena, SlotOf(node.Inputs[0]), 2),
                                  (wic, 0, 2),
-                                 (biasBuf, 0, 2), (arena, 0, 2),
+                                 (biasBuf, 0, 2),
+                                 (arena, resT != uint.MaxValue ? SlotOf(resT) : 0, 2),
                                  (arena, off[outPhys], 2),
-                                 (arena, 0, 2), (arena, 0, 2)],
+                                 (arena, dualT != uint.MaxValue ? SlotOf(dualT) : 0, 2),
+                                 (arena, 0, 2)],
                                 [M, (uint)cout, (uint)Kp, (uint)(Kp / 4),
                                  flags, 0u, 0u,
                                  (uint)outW, (uint)inW, (uint)inH,

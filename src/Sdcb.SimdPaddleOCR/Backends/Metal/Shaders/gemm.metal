@@ -119,8 +119,10 @@ kernel void mm_sg(device const half4* x [[buffer(0)]],
 // mm_sg_dd: same 64x64 tile / 8 simdgroup fan-out as mm_sg, but fragment loads
 // read device memory directly — no threadgroup staging round-trip (this GPU's
 // "threadgroup" memory is just a carve-out of the same DRAM, so staging only
-// adds barriers). Emit-gated to M%64==0 && N%64==0 && K%16==0 so every tile is
-// full and fragment loads never run past the operand end.
+// adds barriers). Emit-gated to K%16==0 only: edge tiles are partial — fragment
+// loads do read past the logical M/N end, which is safe because A overread stays
+// inside the arena's tail slack, W rows are padded, and the epilogue masks
+// mm<p.M / nn<p.N before storing.
 kernel void mm_sg_dd(device const half* x [[buffer(0)]],
                      device const half* w [[buffer(1)]],
                      device const half* bias [[buffer(2)]],
@@ -386,8 +388,10 @@ kernel void mm_dot(device const half4* x [[buffer(0)]],
 // mm_ic_sg: implicit-GEMM kxk conv — mm_sg's staged 64x64x16 pipeline, but the
 // A stage gathers input pixels through tap-major im2col addressing instead of
 // reading a materialized [M,K] matrix. One staged half4 never crosses a tap
-// (cinE%4==0 gate on the emit side). k in [K,Kp) pads to zero via the
-// iy/ix bounds check. Batch-free like the im2col path it replaces.
+// (cinE%4==0 gate on the emit side). p.K is the padded reduction extent
+// (multiple of 16): pad k-slices hit W rows that ConstF16 zero-filled, so they
+// contribute 0 even though the im2col gather may read a real pixel there.
+// Batch-free like the im2col path it replaces.
 struct PcGemmIc {
     uint M, N, K, kv4, flags, mImg, scMod;      // K = Kp (padded, W stride)
     uint outW, inW, inH, sH, sW, pT, pL, kW, cinE;
@@ -494,8 +498,10 @@ kernel void mm_ic_sg(device const half4* x [[buffer(0)]],
 // mm_ic_sg32: implicit-GEMM kxk conv — mm_sg's staged 64x64x16 pipeline, but the
 // A stage gathers input pixels through tap-major im2col addressing instead of
 // reading a materialized [M,K] matrix. One staged half4 never crosses a tap
-// (cinE%4==0 gate on the emit side). k in [K,Kp) pads to zero via the
-// iy/ix bounds check. Batch-free like the im2col path it replaces.
+// (cinE%4==0 gate on the emit side). p.K is the padded reduction extent
+// (multiple of 16): pad k-slices hit W rows that ConstF16 zero-filled, so they
+// contribute 0 even though the im2col gather may read a real pixel there.
+// Batch-free like the im2col path it replaces.
 struct PcGemmIc32 {
     uint M, N, K, kv4, flags, mImg, scMod;      // K = Kp (padded, W stride)
     uint outW, inW, inH, sH, sW, pT, pL, kW, cinE;

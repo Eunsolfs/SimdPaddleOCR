@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using Sdcb.SimdPaddleOCR.OnnxSharp;
 
 namespace Sdcb.SimdPaddleOCR.Backends.Metal;
@@ -38,15 +39,33 @@ internal static class MetalBackend
             { } s when s.Equals("metal", StringComparison.OrdinalIgnoreCase) => true,
             { } s when s.Equals("cpu", StringComparison.OrdinalIgnoreCase)
                     || s.Equals("vulkan", StringComparison.OrdinalIgnoreCase) => false,
-            // Auto: Metal is the GPU of choice on macOS only
-            _ => OperatingSystem.IsMacOS(),
+            // Auto: Apple Silicon only — the GEMM kernels are built around
+            // 32-lane simdgroups and were never validated on Intel/AMD GPUs.
+            _ => OperatingSystem.IsMacOS()
+                && RuntimeInformation.ProcessArchitecture == Architecture.Arm64,
         },
     };
+
+    /// <summary>Metal asked for by name: the option, or Auto with
+    /// SIMD_OCR_BACKEND=metal.</summary>
+    private static bool IsMetalExplicit(OcrBackend backend) =>
+        backend == OcrBackend.Metal
+        || backend == OcrBackend.Auto
+            && string.Equals(Environment.GetEnvironmentVariable("SIMD_OCR_BACKEND"),
+                "metal", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Whether a session for this option runs on Metal. Without an
+    /// Apple GPU family only an explicit choice gets Metal: the simdgroup
+    /// path is unproven off Apple Silicon, so Auto stays on CPU there
+    /// (mirrors <see cref="Vulkan.GpuBackend.UsesGpu"/>).</summary>
+    internal static bool UsesGpu(OcrBackend backend) =>
+        IsMetalSelected(backend) && TryGetDevice() is { } dev
+        && (dev.SupportsApple7 || IsMetalExplicit(backend));
 
     /// <summary>Creates a session on Metal; CPU on any failure.</summary>
     internal static IOcrSession CreateSession(CompiledModel compiled, OcrBackend backend)
     {
-        if (IsMetalSelected(backend) && TryGetDevice() is { } dev)
+        if (UsesGpu(backend) && TryGetDevice() is { } dev)
         {
             try { return new MetalSession(dev, compiled); }
             catch { /* fall through to CPU */ }

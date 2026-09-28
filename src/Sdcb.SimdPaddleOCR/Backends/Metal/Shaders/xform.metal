@@ -3,16 +3,13 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// ---------------- se_fused ----------------
-// Single-pass SE: S threadgroups write per-partition partial sums; the last
-// group to finish (atomic ticket) runs finalize inline: mean → fc1+relu →
-// fc2 → hardsigmoid.
+// ---------------- se_part + se_join ----------------
 struct PcSe { uint hw, C, S, P, cvP, R; float alpha, beta; };
-// SE split into two dispatches: this paravirt GPU only supports
-// memory_order_relaxed device atomics, so the Vulkan-style ticket
-// (last-WG-does-stage2) cannot order partial writes vs reads. Emit
-// se_part for all S workgroups, rely on the inter-dispatch buffer
-// barrier, then se_join (one WG per batch) does stage2.
+// SE split into two dispatches: MSL device atomics are relaxed-only, so the
+// Vulkan-style ticket (last-WG-does-stage2) cannot order partial writes vs
+// reads. Emit se_part for all S workgroups, rely on the inter-dispatch buffer
+// barrier, then se_join (one WG per batch) does stage2: mean → fc1+relu →
+// fc2 → hardsigmoid.
 kernel void se_part(device const half4* x [[buffer(0)]],
                     device float* part [[buffer(1)]],
                     constant PcSe& p [[buffer(2)]],
