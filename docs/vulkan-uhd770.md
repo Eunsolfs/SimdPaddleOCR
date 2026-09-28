@@ -2,7 +2,7 @@
 
 实测机：Intel UHD Graphics 770（Xe-LP，32 EU，核显最大动态频率 1.55 GHz），与 CPU 共享内存。驱动 101.7079（Vulkan API 1.4.323）。Windows，电源计划「高性能」。.NET SDK 11.0.100-rc.1 编译 `net10.0`。`test/Sdcb.SimdPaddleOCR.Tests`，`--workers 4 --benchmark-kind simd --warmup 1`，同一 `dataset/` 100 张，墙钟 n=99。
 
-**结论：没有 16×16×16 fp16 协作矩阵。无矩阵 GEMM 调优一轮后，三档端到端比上一版快 13–34%（medium 1623 → 1073 ms），但仍慢于同机 sharp（约 1.3× / 1.7× / 1.9×）。所以 `Auto` 在这种设备上走 CPU，只有显式指定 `OcrBackend.Vulkan`（或 `Auto` + `SIMD_OCR_BACKEND=vulkan`）才走这条 GPU 路径。两种情况都不编译协作矩阵 shader（Intel 编译器会把进程直接打掉）。sg16 / sg32 / sg32l 的 shader、spv 和路由没改。**
+**结论：没有 16×16×16 fp16 协作矩阵。无矩阵 GEMM 调优一轮后，三档端到端比上一版快 13–34%（medium 1623 → 1073 ms），但仍慢于同机 sharp（约 1.3× / 1.7× / 1.9×）。所以 `Auto` 在这种设备上走 CPU，只有显式指定 `OcrBackend.Vulkan`（或 `Auto` + `SIMD_OCR_BACKEND=vulkan`）才走这条 GPU 路径。两种情况都不编译协作矩阵 shader（Intel 编译器会把进程直接打掉）。sg16 / sg32 / sg32l 的 shader、spv 和路由没改；有 coopmat 的设备按它实际要用的形状判定（sg32 要 16×16×16，sg16 要 8×16×16），B580 仍走 sg16。**
 
 ## 设备能力
 
@@ -20,7 +20,7 @@
 
 ## 走了哪一档
 
-`SubgroupMin` 是 8，进不了 sg32。也没有 `Coop16x16x16`，所以不建任何 `conv1x1_cm*` / `convk_cm*` 管线。大 GEMM（1×1 里没被 dot 接住的、im2col 之后的 GEMM、窄 M 接不住的 MatMul）走 `gemm_nc`：fp16 加载、fp32 按 K 正序累加、fp16 写回，绑定和 16 字节 push constant 与 `conv1x1_cm` 相同，不用 subgroup 内置量。
+`SubgroupMin` 是 8，进不了 sg32。也没有 coopmat 扩展（`CoopGemm` 为假），所以不建任何 `conv1x1_cm*` / `convk_cm*` 管线。大 GEMM（1×1 里没被 dot 接住的、im2col 之后的 GEMM、窄 M 接不住的 MatMul）走 `gemm_nc`：fp16 加载、fp32 按 K 正序累加、fp16 写回，绑定和 16 字节 push constant 与 `conv1x1_cm` 相同，不用 subgroup 内置量。
 
 当前 tile：工作组 64 线程，输出块 64×64，每线程 8×8 个 fp32 累加器，K 方向 16。A / B 块在写入共享内存时就转成 fp32，并按 k-major 存放，内层每步是一次 A 广播读、一次 B 连续读，没有 bank 冲突，也不再在每次 FMA 前做 fp16→fp32 转换。下一块的全局读在本块 FMA 之前发出（寄存器预取）。
 
@@ -36,7 +36,9 @@
 
 `PackSlabs` 只在这条档上额外打开，`_sg32` 的条件没动。kxk 仍是 `convk_dot` / im2col，门槛没改（见下文放弃项）。
 
-选路在 `GpuBackend.UsesGpu`：设备没有 `Coop16x16x16` 时，只有显式选了 Vulkan 才建 GPU 会话，`Auto` 直接给 CPU 会话。`OcrSessionFactory.IsGpuBackend` 用同一个谓词，所以 `Auto` 在这里也按 CPU 的方式分批（之前它只看"设备探测成功"，会给 CPU 会话配上 GPU 的 16 行识别批）。`GpuGraphModel` 只看能力：没有 `Coop16x16x16` 就建 `gemm_nc` / `gemm_nc_s`，不碰任何 cm 管线。
+能力判定是 `VkDevice.CoopGemm`：设备会选的那套 cm shader 所需的 fp16→fp32 subgroup 形状是否在 coopmat 列表里。sg32（`SubgroupMin > 16`）要 16×16×16；sg16 的 `conv1x1_cm` 是 A 8×16、B 16×16、累加 8×16，要 8×16×16。B580 只报 8×16×16，所以不能只认 16×16×16，否则它会从 sg16 cm 掉进这条档（本机实测 medium 56 → 775 ms）。
+
+选路在 `GpuBackend.UsesGpu`：`CoopGemm` 为假时，只有显式选了 Vulkan 才建 GPU 会话，`Auto` 直接给 CPU 会话。`OcrSessionFactory.IsGpuBackend` 用同一个谓词，所以 `Auto` 在这里也按 CPU 的方式分批（之前它只看"设备探测成功"，会给 CPU 会话配上 GPU 的 16 行识别批）。`GpuGraphModel` 只看能力：`CoopGemm` 为假就建 `gemm_nc` / `gemm_nc_s`，不碰任何 cm 管线。
 
 ## 端到端（4 workers，median ms/图）
 
@@ -127,4 +129,4 @@ GEMM（`--rawbench`，SIMD8，GEMM 形状集总和；同一时段内比较）：
 
 统一内存上的 `preferHost` 修正是一直生效的：先仍选非 device-local 的主机缓存类型（独显走这里），只有选不中时才接受 device-local + host-cached。
 
-没有改 sg16 / sg32 / sg32l 的 shader、spv 或选择条件，新增的判断都挂在 `_nocm` 上（没有 `Coop16x16x16` 时置位），`UsesGpu` 对有 `Coop16x16x16` 的设备与原来的条件相同。全量重编后其余 `.spv` 逐字节不变。B580、3080 Ti、880M 上不需要为这次改动复测。
+没有改 sg16 / sg32 / sg32l 的 shader、spv 或选择条件，新增的判断都挂在 `_nocm` 上（`CoopGemm` 为假时置位），`UsesGpu` 对 `CoopGemm` 为真的设备与原来的条件相同。全量重编后其余 `.spv` 逐字节不变。B580 已按 `CoopGemm` 复测，仍走 sg16，端到端与改前持平；3080 Ti、880M 报 16×16×16，判定结果与之前相同。

@@ -79,7 +79,8 @@ internal sealed class GpuGraphModel
     // sg32 lite family only: direct-load plain GEMM (M >= 16, K % 16 == 0)
     private readonly VkPipeline? _pCmD, _pCmDN64, _pCmDN32, _pDw4A;
     private readonly bool _lite;
-    // No 16×16×16 coopmat: subgroup-free gemm_nc instead of every cm pipe
+    // No coopmat of the selected cm set's shape (VkDevice.CoopGemm):
+    // subgroup-free gemm_nc instead of every cm pipe
     // (Intel's compiler aborts the process on those shaders). Sessions only
     // reach this for an explicit OcrBackend.Vulkan — GpuBackend.UsesGpu.
     private readonly bool _nocm;
@@ -188,10 +189,10 @@ internal sealed class GpuGraphModel
         _dev = dev;
         _compiled = compiled;
         _model = compiled.Model;
-        _nocm = !dev.Coop16x16x16;
+        _nocm = !dev.CoopGemm;
         // sg16-only coopmat shaders: NVIDIA (sg 32-32) and AMD wave64 cannot
         // satisfy requiredSubgroupSize=16 — swap in the sg32 variant.
-        _sg32 = !_nocm && dev.SubgroupMin > 16 && dev.SubgroupMax >= 32;
+        _sg32 = !_nocm && dev.Sg32Subgroup;
         if (_nocm)
         {
             // One tile; n64/n32 stay aliases so CmTile's sg16 cout split is

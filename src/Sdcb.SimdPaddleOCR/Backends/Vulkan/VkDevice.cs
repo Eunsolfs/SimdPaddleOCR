@@ -21,6 +21,7 @@ internal unsafe sealed class VkDevice : IDisposable
     public bool SubgroupSizeControl;   // VK_EXT_subgroup_size_control
     public bool ComputeSubgroupSize;   // ...and requiredSubgroupSizeStages covers compute
     public bool Coop16x16x16;          // fp16 A/B, fp32 C/result, subgroup scope 16x16x16
+    public bool Coop8x16x16;           // same types, MxNxK 8x16x16 (Arc)
     public uint SubgroupMin = 1, SubgroupMax = 128;
     public uint MaxSharedMemory;       // maxComputeSharedMemorySize (bytes per workgroup)
     public int CoopM, CoopN, CoopK;    // best fp16->fp32 subgroup coopmat config
@@ -29,6 +30,11 @@ internal unsafe sealed class VkDevice : IDisposable
     public uint DeviceLocalHostVisibleType = uint.MaxValue;
     public uint HostVisibleCoherentType = uint.MaxValue;
     public bool PushDescriptors;
+    /// <summary>Cannot pin a 16-lane subgroup: the sg32 cm shaders instead of sg16.</summary>
+    public bool Sg32Subgroup => SubgroupMin > 16 && SubgroupMax >= 32;
+    /// <summary>The MMA shape of the cm shader set this device selects is advertised:
+    /// sg32 uses 16x16x16, sg16 (<c>conv1x1_cm</c>) uses 8x16x16.</summary>
+    public bool CoopGemm => CoopMatrix && (Sg32Subgroup ? Coop16x16x16 : Coop8x16x16);
     public uint QueuePriority;          // VkQueueGlobalPriority granted (0 = driver default)
     private unsafe delegate* unmanaged[Cdecl]<IntPtr, uint, IntPtr, uint, uint, Vk.VkWriteDescriptorSet*, void> _pushDesc;
     public double TimestampPeriodNs = 1;
@@ -310,8 +316,11 @@ internal unsafe sealed class VkDevice : IDisposable
                         d.CoopM = (int)cmprops[i].MSize; d.CoopN = (int)cmprops[i].NSize; d.CoopK = (int)cmprops[i].KSize;
                     }
                     if (cmprops[i].AType == 0 && cmprops[i].BType == 0 && cmprops[i].CType == 1 && cmprops[i].ResultType == 1
-                        && cmprops[i].Scope == 3 && cmprops[i].MSize == 16 && cmprops[i].NSize == 16 && cmprops[i].KSize == 16)
-                        d.Coop16x16x16 = true;
+                        && cmprops[i].Scope == 3 && cmprops[i].NSize == 16 && cmprops[i].KSize == 16)
+                    {
+                        if (cmprops[i].MSize == 16) d.Coop16x16x16 = true;
+                        if (cmprops[i].MSize == 8) d.Coop8x16x16 = true;
+                    }
                     if (Environment.GetEnvironmentVariable("HYMT_VK_VERBOSE") == "1")
                         Console.Error.WriteLine($"[vk] coopmat {cmprops[i].MSize}x{cmprops[i].NSize}x{cmprops[i].KSize} at={cmprops[i].AType} bt={cmprops[i].BType} ct={cmprops[i].CType} rt={cmprops[i].ResultType} scope={cmprops[i].Scope}");
                 }
