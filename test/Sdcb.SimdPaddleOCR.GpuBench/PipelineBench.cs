@@ -68,13 +68,10 @@ static class PipelineBench
                 : Sdcb.SimdPaddleOCR.OnnxSharp.Model.Load(File.ReadAllBytes(clsPath));
             using var ocr = new Sdcb.SimdPaddleOCR.PaddleOcrAll(detM, clsM, recM, File.ReadAllBytes(keysPath), opts);
 
-            using var bmp = new System.Drawing.Bitmap(imgPath);
-            var bd = bmp.LockBits(new System.Drawing.Rectangle(0, 0, bmp.Width, bmp.Height),
-                System.Drawing.Imaging.ImageLockMode.ReadOnly,
-                System.Drawing.Imaging.PixelFormat.Format24bppRgb);
-            byte[] bgr = new byte[bmp.Height * bd.Stride];
-            Marshal.Copy(bd.Scan0, bgr, 0, bgr.Length);
-            bmp.UnlockBits(bd);
+            using var _im = SixLabors.ImageSharp.Image.Load<SixLabors.ImageSharp.PixelFormats.Bgr24>(imgPath);
+            byte[] bgr = new byte[_im.Width * _im.Height * 3];
+            _im.CopyPixelDataTo(bgr);
+            int imgW = _im.Width, imgH = _im.Height, imgStride = imgW * 3;
 
             bool prof = Environment.GetEnvironmentVariable("SIMD_OCR_PROF") == "1";
             Sdcb.SimdPaddleOCR.PipelineProfiler.Enable(prof);
@@ -82,7 +79,7 @@ static class PipelineBench
             {
                 if (prof) Sdcb.SimdPaddleOCR.PipelineProfiler.Enable(true);   // reset per rep
                 var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-                var r = ocr.Run(bgr, bmp.Width, bmp.Height, bd.Stride,
+                var r = ocr.Run(bgr, imgW, imgH, imgStride,
                     Sdcb.SimdPaddleOCR.ImagePixelFormat.Bgr24);
                 double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) /
                     (double)System.Diagnostics.Stopwatch.Frequency * 1000;

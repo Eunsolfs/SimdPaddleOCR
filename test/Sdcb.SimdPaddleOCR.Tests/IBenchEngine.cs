@@ -49,9 +49,10 @@ static class BenchEngines
         // the factory pick (Vulkan when a usable device exists).
         "sharp" => new SharpEngine(modelType, workers, OcrBackend.Cpu),
         "vulkan" => new SharpEngine(modelType, workers, OcrBackend.Vulkan),
+        "metal" => new SharpEngine(modelType, workers, OcrBackend.Metal),
         "auto" => new SharpEngine(modelType, workers, OcrBackend.Auto),
         "c" => new CEngine(cAssetsDir, workers, modelType),
-        _ => throw new ArgumentException("--engine must be sharp, vulkan, auto, or c"),
+        _ => throw new ArgumentException("--engine must be sharp, vulkan, metal, auto, or c"),
     };
 
     public static PaddleOcrModelBundle Bundle(string modelType) => modelType switch

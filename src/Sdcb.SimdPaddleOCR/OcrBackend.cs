@@ -9,4 +9,6 @@ public enum OcrBackend
     Cpu,
     /// <summary>Run the graph on Vulkan; falls back to CPU when no usable device exists.</summary>
     Vulkan,
+    /// <summary>Run the graph on Metal (macOS); falls back to CPU when no usable device exists.</summary>
+    Metal,
 }
