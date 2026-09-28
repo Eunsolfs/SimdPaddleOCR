@@ -71,7 +71,7 @@ internal sealed class GpuGraphModel
         _pDw, _pDw4, _pDw4T, _pDense, _pConvT, _pConvT4, _pElem, _pElem4,
         _pReduce, _pReduce4, _pReduce4b, _pPool, _pPool4,
         _pResize, _pResize4, _pResize4Add, _pConcat, _pConcat4, _pNchw, _pOut, _pIm2col,
-        _pAddPs, _pSeA, _pSeB, _pSeF, _pConvD, _pConvDF32, _pCatRes,
+        _pAddPs, _pSeF, _pConvD, _pConvDF32, _pCatRes,
         _pAvg4, _pAffine, _pLn, _pAttn, _pDotSk;
     // sg32 only (128x128 / 128x64 / 128x32 tiles): implicit-GEMM kxk conv,
     // SE-prescaled pointwise conv
@@ -79,6 +79,13 @@ internal sealed class GpuGraphModel
     // sg32 lite family only: direct-load plain GEMM (M >= 16, K % 16 == 0)
     private readonly VkPipeline? _pCmD, _pCmDN64, _pCmDN32, _pDw4A;
     private readonly bool _lite;
+    // No coopmat of the selected cm set's shape (VkDevice.CoopGemm):
+    // subgroup-free gemm_nc instead of every cm pipe
+    // (Intel's compiler aborts the process on those shaders). Sessions only
+    // reach this for an explicit OcrBackend.Vulkan — GpuBackend.UsesGpu.
+    private readonly bool _nocm;
+    // gemm_nc built with the unrolled no-act / relu / hardswish, single-output tail
+    private readonly VkPipeline? _pGemmNcS;
 
     // fp16 copies of constant tensors (weights, biases, scalars), lazy
     private readonly Dictionary<(int, int, int, int), VkBuffer> _constF16 = new();
@@ -182,10 +189,22 @@ internal sealed class GpuGraphModel
         _dev = dev;
         _compiled = compiled;
         _model = compiled.Model;
+        _nocm = !dev.CoopGemm;
         // sg16-only coopmat shaders: NVIDIA (sg 32-32) and AMD wave64 cannot
         // satisfy requiredSubgroupSize=16 — swap in the sg32 variant.
-        _sg32 = dev.SubgroupMin > 16 && dev.SubgroupMax >= 32;
-        if (_sg32)
+        _sg32 = !_nocm && dev.Sg32Subgroup;
+        if (_nocm)
+        {
+            // One tile; n64/n32 stay aliases so CmTile's sg16 cout split is
+            // not reused here. 8 lanes keep its 64 fp32 accumulators in
+            // registers (UHD 770: SIMD16 spills, 4x slower).
+            bool sg8 = dev.ComputeSubgroupSize && dev.SubgroupMin <= 8 && dev.SubgroupMax >= 8;
+            _pConv1x1 = Pipe("gemm_nc", 6, 16, sg8 ? 8u : 0u);
+            _pGemmNcS = Pipe("gemm_nc_s", 6, 16, sg8 ? 8u : 0u);
+            _pConv1x1N64 = _pConv1x1;
+            _pConv1x1N32 = _pConv1x1;
+        }
+        else if (_sg32)
         {
             // the sg32 lane mapping is hard-wired: without a pinned 32-lane
             // compute subgroup (a wave64 default) or the 16x16x16 fp16 MMA
@@ -241,8 +260,6 @@ internal sealed class GpuGraphModel
         _pElem = Pipe("elem", 3, 24);
         _pElem4 = Pipe("elem4", 3, 24);
         _pAddPs = Pipe("addps", 4, 12);
-        _pSeA = Pipe("se_a", 2, 20);
-        _pSeB = Pipe("se_b", 6, 24);
         _pSeF = Pipe("se_fused", 8, 32);
         _pConvD = Pipe("convk_dot", 5, 60);
         _pConvDF32 = Pipe("convk_f32n", 5, 68);
@@ -859,8 +876,11 @@ internal sealed class GpuGraphModel
         // coopmat tile: cout<=32 -> 512x32, cout<=64 -> 256x64, else 128x128
         // sg32: cout<=32 -> 128x32, cout<=64 -> 128x64, else 128x128
         // m/k > 0: a plain GEMM that may take the direct-load kernel (lite)
+        VkPipeline NcTail(VkPipeline p, uint f) =>
+            _nocm && (f & 8u) == 0 && ((f >> 4) & 7u) is 0 or 1 or 3 ? _pGemmNcS! : p;
         (VkPipeline pipe, uint tm, uint tn) CmTile(int c, long m = 0, int k = 0) =>
-            _pCmD is not null && m >= 16 && k > 0 && k % 16 == 0
+            _nocm ? (_pConv1x1, 64u, 64u)
+            : _pCmD is not null && m >= 16 && k > 0 && k % 16 == 0
                 ? (c <= 32 ? (_pCmDN32!, 128u, 32u) : c <= 64 ? (_pCmDN64!, 128u, 64u) : (_pCmD, 128u, 128u))
             : _sg32 ? (c <= 32 ? (_pConv1x1N32, 128u, 32u)
                      : c <= 64 ? (_pConv1x1N64, 128u, 64u)
@@ -1250,6 +1270,10 @@ internal sealed class GpuGraphModel
                         if (dotOk && _sg32 && (long)M * cout > 1L << (_lite ? 16 : 18)
                             && (hasPs || !addpsSrc.ContainsKey(Phys(checked((int)node.Inputs[0])))))
                             dotOk = false;
+                        // no-coopmat GEMM likewise; it has no SE-prescale variant
+                        if (dotOk && _nocm && !hasPs && (long)M * cout > 1L << 16
+                            && !addpsSrc.ContainsKey(Phys(checked((int)node.Inputs[0]))))
+                            dotOk = false;
                         if (dotOk)
                         {
                             // small-K pointwise conv: direct dot kernel beats coopmat.
@@ -1298,7 +1322,7 @@ internal sealed class GpuGraphModel
                                 cb = [.. cb, (arena, SlotOf(psv.se), 2)];
                                 cpc = [.. cpc, mImg];
                             }
-                            Emit(cp, $"conv1x1 n{ni} {M}x{cin}x{cout}", cb, cpc,
+                            Emit(NcTail(cp, flags), $"conv1x1 n{ni} {M}x{cin}x{cout}", cb, cpc,
                                 (M + tm - 1) / tm, (uint)((cout + tn - 1) / tn));
                         }
                     }
@@ -1481,7 +1505,8 @@ internal sealed class GpuGraphModel
                             Div256(M * (long)(Kp / 4)));
                         VkBuffer wbuf = ConstTapMajor(checked((int)node.Inputs[1]),
                             cout, cin, kH, kW, Kp, cinPad: cinIn);
-                        if (cout % 4 == 0 && scalarBias == 0 && Kp <= 128)
+                        if (cout % 4 == 0 && scalarBias == 0 && Kp <= 128
+                            && !(_nocm && (long)M * cout > 1L << 16))
                         {
                             VkBuffer wk = ConstKMajor(checked((int)node.Inputs[1]),
                                 cout, cin, kH * kW, Kp, cinIn);
@@ -1497,7 +1522,7 @@ internal sealed class GpuGraphModel
                         else
                         {
                             var (cp, tm, tn) = CmTile(cout);
-                            Emit(cp, $"im2colconv n{ni} {M}x{Kp}x{cout}",
+                            Emit(NcTail(cp, flags), $"im2colconv n{ni} {M}x{Kp}x{cout}",
                                 [(arena, im2colOff, 2), (wbuf, 0, 2),
                                  (biasBuf, 0, 2), (arena, 0, 2), (arena, off[outPhys], 2)],
                                 [M, (uint)cout, (uint)Kp, flags],
@@ -2139,7 +2164,7 @@ internal sealed class GpuGraphModel
                         break;
                     }
                     var (cp2, tm2, tn2) = CmTile(mmN, mmM, mmK);
-                    Emit(cp2, $"matmul n{ni} {mmM}x{mmK}x{mmN}",
+                    Emit(NcTail(cp2, mmFlags), $"matmul n{ni} {mmM}x{mmK}x{mmN}",
                         [(arena, SlotOf(node.Inputs[0]), 2),
                          (ConstGemmW(checked((int)node.Inputs[1]), mmK, mmN), 0, 2),
                          (mmBias, 0, 2), (arena, 0, 2),
@@ -2210,8 +2235,9 @@ internal sealed class GpuGraphModel
                 Console.Error.WriteLine($"rec[{ri}] {recs[ri].Tag} gx={recs[ri].Gx} gy={recs[ri].Gy}");
 
         // device-independent, but the sg16 (Arc) kernel set has not been
-        // verified against packed slabs yet
-        if (_sg32) PackSlabs(recs, arena, off, slabElems, ref im2colOff);
+        // verified against packed slabs yet. The no-coopmat tile only binds
+        // slab starts, same as the sg32 GEMM, so packing is safe there too.
+        if (_sg32 || _nocm) PackSlabs(recs, arena, off, slabElems, ref im2colOff);
         // +128*512: coopmat A-tile reads pad rows past M
         long arenaElems = im2colOff + maxIm2col + 128 * 512 + (1L << 20);
         return new GpuSchedule

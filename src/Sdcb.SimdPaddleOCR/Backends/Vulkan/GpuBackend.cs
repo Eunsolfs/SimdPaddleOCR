@@ -40,10 +40,27 @@ internal static class GpuBackend
         },
     };
 
+    /// <summary>Vulkan asked for by name: the option, or Auto with
+    /// SIMD_OCR_BACKEND=vulkan.</summary>
+    private static bool IsVulkanExplicit(OcrBackend backend) =>
+        backend == OcrBackend.Vulkan
+        || backend == OcrBackend.Auto
+            && string.Equals(Environment.GetEnvironmentVariable("SIMD_OCR_BACKEND"),
+                "vulkan", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Whether a session for this option runs on the GPU. Without an
+    /// fp16 cooperative matrix of the cm shaders' shape (<see cref="VkDevice.CoopGemm"/>)
+    /// only an explicit Vulkan choice gets the no-coopmat GEMM tier: it trails
+    /// the CPU on every model measured (docs/vulkan-uhd770.md), so Auto stays
+    /// on the CPU there.</summary>
+    internal static bool UsesGpu(OcrBackend backend) =>
+        IsVulkanSelected(backend) && TryGetDevice() is { } dev
+        && (dev.CoopGemm || IsVulkanExplicit(backend));
+
     /// <summary>Creates a session on the resolved backend; CPU on any GPU failure.</summary>
     internal static IOcrSession CreateSession(CompiledModel compiled, OcrBackend backend)
     {
-        if (IsVulkanSelected(backend) && TryGetDevice() is { } dev)
+        if (UsesGpu(backend) && TryGetDevice() is { } dev)
         {
             try { return new GpuSession(dev, compiled); }
             catch { /* fall through to CPU */ }

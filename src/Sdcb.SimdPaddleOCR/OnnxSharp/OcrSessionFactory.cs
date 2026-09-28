@@ -17,12 +17,11 @@ internal static class OcrSessionFactory
 #endif
     }
 
-    /// <summary>True when the option resolves to GPU AND a device probed OK.</summary>
+    /// <summary>True when the option resolves to a GPU session on the probed device.</summary>
     internal static bool IsGpuBackend(OcrBackend backend)
     {
 #if NET10_0_OR_GREATER
-        return Backends.Vulkan.GpuBackend.IsVulkanSelected(backend) &&
-            Backends.Vulkan.GpuBackend.TryGetDevice() is not null;
+        return Backends.Vulkan.GpuBackend.UsesGpu(backend);
 #else
         _ = backend;
         return false;
