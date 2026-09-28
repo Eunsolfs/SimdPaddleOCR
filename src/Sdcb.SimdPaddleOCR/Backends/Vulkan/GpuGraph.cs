@@ -86,6 +86,9 @@ internal sealed class GpuGraphModel
     private readonly bool _nocm;
     // gemm_nc built with the unrolled no-act / relu / hardswish, single-output tail
     private readonly VkPipeline? _pGemmNcS;
+    // no-coopmat tier on a device that cannot pin a narrow subgroup (Adreno
+    // wave64): direct-load GEMM plus the routing measured on Adreno 750
+    private readonly bool _ncWide;
 
     // fp16 copies of constant tensors (weights, biases, scalars), lazy
     private readonly Dictionary<(int, int, int, int), VkBuffer> _constF16 = new();
@@ -201,6 +204,7 @@ internal sealed class GpuGraphModel
             // 8-lane pin (wave64 Adreno) the register-prefetch form is
             // miscompiled there; the direct-load build is exact and faster.
             bool sg8 = dev.ComputeSubgroupSize && dev.SubgroupMin <= 8 && dev.SubgroupMax >= 8;
+            _ncWide = !sg8;
             _pConv1x1 = sg8 ? Pipe("gemm_nc", 6, 16, 8u) : Pipe("gemm_nc_d", 6, 16);
             _pGemmNcS = sg8 ? Pipe("gemm_nc_s", 6, 16, 8u) : Pipe("gemm_nc_ds", 6, 16);
             _pConv1x1N64 = _pConv1x1;
@@ -1730,9 +1734,9 @@ internal sealed class GpuGraphModel
                         seCtr += nb;   // one ticket counter per batch
                         break;
                     }
-                    // lite parts take it at any size: reduce_hw's one-channel
-                    // workgroups read 2 bytes at a C*2 stride
-                    if (c % 4 == 0 && 256 % cv4 == 0 && (hw >= 4096 || _lite))
+                    // lite and wide no-coopmat parts take it at any size:
+                    // reduce_hw's one-channel workgroups read 2 bytes at a C*2 stride
+                    if (c % 4 == 0 && 256 % cv4 == 0 && (hw >= 4096 || _lite || _ncWide))
                     {
                         // two-phase: S pixel partitions → fp32 partials → mean
                         int s = PartSplits(hw, c);
