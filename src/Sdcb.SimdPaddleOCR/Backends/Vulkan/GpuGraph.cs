@@ -71,7 +71,7 @@ internal sealed class GpuGraphModel
         _pDw, _pDw4, _pDw4T, _pDense, _pConvT, _pConvT4, _pElem, _pElem4,
         _pReduce, _pReduce4, _pReduce4b, _pPool, _pPool4,
         _pResize, _pResize4, _pResize4Add, _pConcat, _pConcat4, _pNchw, _pOut, _pIm2col,
-        _pAddPs, _pSeA, _pSeB, _pSeF, _pConvD, _pConvDF32, _pCatRes,
+        _pAddPs, _pSeF, _pConvD, _pConvDF32, _pCatRes,
         _pAvg4, _pAffine, _pLn, _pAttn, _pDotSk;
     // sg32 only (128x128 / 128x64 / 128x32 tiles): implicit-GEMM kxk conv,
     // SE-prescaled pointwise conv
@@ -259,8 +259,6 @@ internal sealed class GpuGraphModel
         _pElem = Pipe("elem", 3, 24);
         _pElem4 = Pipe("elem4", 3, 24);
         _pAddPs = Pipe("addps", 4, 12);
-        _pSeA = Pipe("se_a", 2, 20);
-        _pSeB = Pipe("se_b", 6, 24);
         _pSeF = Pipe("se_fused", 8, 32);
         _pConvD = Pipe("convk_dot", 5, 60);
         _pConvDF32 = Pipe("convk_f32n", 5, 68);
