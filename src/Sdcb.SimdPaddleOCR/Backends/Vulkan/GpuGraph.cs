@@ -316,7 +316,9 @@ internal sealed class GpuGraphModel
         }
         else
         {
-            alloc = Math.Max(n, padRows * rowElems);
+            // whole 16 B: kernels read scalars as a packed half pair / f16vec4,
+            // and Adreno bounds-checks every load against the binding range
+            alloc = (Math.Max(n, padRows * rowElems) + 7) / 8 * 8;
             h = new Half[alloc];
             for (int i = 0; i < n; i++) h[i] = (Half)f32[i];
         }
@@ -349,7 +351,7 @@ internal sealed class GpuGraphModel
     private VkBuffer VecF16((int, int) key, float[] v)
     {
         if (_vecF16.TryGetValue(key, out VkBuffer? cached)) return cached;
-        Half[] h = new Half[v.Length];
+        Half[] h = new Half[(v.Length + 7) / 8 * 8];
         for (int i = 0; i < v.Length; i++) h[i] = (Half)v[i];
         VkBuffer buf = _dev.NewStorageBuffer((ulong)h.Length * 2, hostVisible: false);
         unsafe { fixed (Half* p = h) _dev.Upload(buf, p, (ulong)h.Length * 2); }
