@@ -18,5 +18,9 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="Shaders\*.spv" CopyToOutputDirectory="PreserveNewest" />
+    <Compile Include="..\Sdcb.SimdPaddleOCR.AndroidBench\LayerProbe.cs" Link="LayerProbe.cs" />
+    <Compile Include="..\Sdcb.SimdPaddleOCR.AndroidBench\GemmTest.cs" Link="GemmTest.cs" />
+    <Compile Include="..\Sdcb.SimdPaddleOCR.AndroidBench\Paths.cs" Link="Paths.cs" />
+    <Compile Include="..\Sdcb.SimdPaddleOCR.AndroidBench\Compare.cs" Link="Compare.cs" />
   </ItemGroup>
 </Project>
