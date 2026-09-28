@@ -39,6 +39,10 @@ if ($Install) {
 }
 
 function Start-Bench([string]$id, [string]$argv, [string]$envs) {
+    # a previous run may still be exiting: an intent delivered to it would be
+    # swallowed by the dying activity instead of starting a fresh process
+    & $Adb shell "am force-stop $pkg"
+    for ($i = 0; $i -lt 20 -and ((& $Adb shell "pidof $pkg") -join ""); $i++) { Start-Sleep -Milliseconds 500 }
     & $Adb shell "rm -f $remote/out/$id.done $remote/out/$id.log"
     $cmd = "am start -S -n $pkg/$pkg.MainActivity --es run '$id' --es args '$argv'"
     if ($envs) { $cmd += " --es env '$envs'" }
