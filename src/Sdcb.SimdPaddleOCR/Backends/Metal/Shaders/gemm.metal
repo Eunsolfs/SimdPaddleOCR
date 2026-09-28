@@ -389,9 +389,11 @@ kernel void mm_dot(device const half4* x [[buffer(0)]],
 // A stage gathers input pixels through tap-major im2col addressing instead of
 // reading a materialized [M,K] matrix. One staged half4 never crosses a tap
 // (cinE%4==0 gate on the emit side). p.K is the padded reduction extent
-// (multiple of 16): pad k-slices hit W rows that ConstF16 zero-filled, so they
-// contribute 0 even though the im2col gather may read a real pixel there.
-// Batch-free like the im2col path it replaces.
+// (multiple of 16): pad k-slices gather REAL pixels (tap>=kH*kW still lands
+// in-bounds) but multiply against W rows that ConstF16 zero-filled, so they
+// contribute 0 — correct for finite activations; an inf activation would make
+// NaN here (0*inf), which no real graph produces. Batch-free like the im2col
+// path it replaces.
 struct PcGemmIc {
     uint M, N, K, kv4, flags, mImg, scMod;      // K = Kp (padded, W stride)
     uint outW, inW, inH, sH, sW, pT, pL, kW, cinE;
@@ -499,9 +501,11 @@ kernel void mm_ic_sg(device const half4* x [[buffer(0)]],
 // A stage gathers input pixels through tap-major im2col addressing instead of
 // reading a materialized [M,K] matrix. One staged half4 never crosses a tap
 // (cinE%4==0 gate on the emit side). p.K is the padded reduction extent
-// (multiple of 16): pad k-slices hit W rows that ConstF16 zero-filled, so they
-// contribute 0 even though the im2col gather may read a real pixel there.
-// Batch-free like the im2col path it replaces.
+// (multiple of 16): pad k-slices gather REAL pixels (tap>=kH*kW still lands
+// in-bounds) but multiply against W rows that ConstF16 zero-filled, so they
+// contribute 0 — correct for finite activations; an inf activation would make
+// NaN here (0*inf), which no real graph produces. Batch-free like the im2col
+// path it replaces.
 struct PcGemmIc32 {
     uint M, N, K, kv4, flags, mImg, scMod;      // K = Kp (padded, W stride)
     uint outW, inW, inH, sH, sW, pT, pL, kW, cinE;

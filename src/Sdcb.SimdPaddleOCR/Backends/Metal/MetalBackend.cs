@@ -13,6 +13,7 @@ internal static class MetalBackend
     private static readonly object s_probeLock = new();
     private static MtlDevice? s_device;
     private static bool s_probed;
+    private static int s_announced;
 
     /// <summary>The shared device, or null when Metal is unavailable (not
     /// macOS, no GPU, or the ObjC bridge can't be reached).</summary>
@@ -67,7 +68,14 @@ internal static class MetalBackend
     {
         if (UsesGpu(backend) && TryGetDevice() is { } dev)
         {
-            try { return new MetalSession(dev, compiled); }
+            try
+            {
+                // one stderr breadcrumb per process so CI/users can tell the
+                // Metal path actually engaged (a failed probe is silent).
+                if (System.Threading.Interlocked.Exchange(ref s_announced, 1) == 0)
+                    Console.Error.WriteLine($"[metal] device: {dev.Name}");
+                return new MetalSession(dev, compiled);
+            }
             catch { /* fall through to CPU */ }
         }
         return compiled.CreateRequest();
