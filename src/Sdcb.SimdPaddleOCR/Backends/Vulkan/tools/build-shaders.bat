@@ -51,3 +51,6 @@ rem nocm: subgroup-free fp16 GEMM (devices without 16x16x16 coopmat)
 echo glslc gemm_nc
 "%GLSLC%" -O --target-env=vulkan1.1 "%DIR%\gemm_nc.comp" -o "%DIR%\gemm_nc.spv" || exit /b 1
 "%GLSLC%" -O --target-env=vulkan1.1 -DSIMPLE "%DIR%\gemm_nc.comp" -o "%DIR%\gemm_nc_s.spv" || exit /b 1
+rem nocm without a pinnable narrow subgroup (Adreno wave64): no register prefetch
+"%GLSLC%" -O --target-env=vulkan1.1 -DDIRECT "%DIR%\gemm_nc.comp" -o "%DIR%\gemm_nc_d.spv" || exit /b 1
+"%GLSLC%" -O --target-env=vulkan1.1 -DDIRECT -DSIMPLE "%DIR%\gemm_nc.comp" -o "%DIR%\gemm_nc_ds.spv" || exit /b 1

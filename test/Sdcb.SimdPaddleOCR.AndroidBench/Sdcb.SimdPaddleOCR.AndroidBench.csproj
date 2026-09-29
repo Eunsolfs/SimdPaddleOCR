@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Dev/bench host only: runs the library's net10.0 build (AdvSimd CPU kernels +
+    Vulkan backend) inside an Android process. Driven by run.ps1 over adb.
+    Models and dataset are pushed to the app's external files dir, not packaged.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0-android</TargetFramework>
+    <SupportedOSPlatformVersion>29</SupportedOSPlatformVersion>
+    <OutputType>Exe</OutputType>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>preview</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsPackable>false</IsPackable>
+    <AssemblyName>Sdcb.SimdPaddleOCR.AndroidBench</AssemblyName>
+    <RootNamespace>Sdcb.SimdPaddleOCR.AndroidBench</RootNamespace>
+    <ApplicationId>com.sdcb.simdocr.bench</ApplicationId>
+    <ApplicationTitle>SimdOcrBench</ApplicationTitle>
+    <ApplicationVersion>1</ApplicationVersion>
+    <ApplicationDisplayVersion>1.0</ApplicationDisplayVersion>
+    <RuntimeIdentifier>android-arm64</RuntimeIdentifier>
+    <AndroidPackageFormat>apk</AndroidPackageFormat>
+    <EmbedAssembliesIntoApk>true</EmbedAssembliesIntoApk>
+    <PublishTrimmed>false</PublishTrimmed>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- a loose .pdb trips the CoreCLR packaging targets (MSB4096 DestinationSubPath) -->
+    <DebugType>embedded</DebugType>
+    <!-- CoreCLR (RyuJIT) like the desktop numbers; Mono's JIT has no AdvSimd. -->
+    <UseMonoRuntime Condition="'$(UseMonoRuntime)' == ''">false</UseMonoRuntime>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Sdcb.SimdPaddleOCR\Sdcb.SimdPaddleOCR.csproj" />
+    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.11" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="..\Sdcb.SimdPaddleOCR.Tests\BenchSummary.cs" Link="BenchSummary.cs" />
+    <EmbeddedResource Include="..\Sdcb.SimdPaddleOCR.GpuBench\Shaders\sgsize.spv" Link="sgsize.spv" LogicalName="sgsize.spv" />
+    <EmbeddedResource Include="Shaders\peak.spv" LogicalName="peak.spv" />
+    <EmbeddedResource Include="Shaders\peak16.spv" LogicalName="peak16.spv" />
+  </ItemGroup>
+</Project>

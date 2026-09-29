@@ -13,5 +13,11 @@ return args[0] switch
     "--rec" => RecCompare.Run(args),
     "--recprof" or "--sessiso" or "--reciso" or "--recreal" => RecBench.Run(args),
     "--conc" or "--pipe" => PipelineBench.Run(args),
+    "--gemm" => Sdcb.SimdPaddleOCR.AndroidBench.GemmTest.Run(args),
+    // same checks as the phone host; models from bench-out/models, images from dataset/
+    "--detcmp" or "--reccmp" => DesktopPaths.Run(Sdcb.SimdPaddleOCR.AndroidBench.Compare.Run, args),
+    "--layers" when args.Length >= 5 => Sdcb.SimdPaddleOCR.AndroidBench.LayerProbe.Run(args[1], int.Parse(args[2]),
+        int.Parse(args[3]), int.Parse(args[4]), args.Length > 5 ? int.Parse(args[5]) : 0,
+        args.Length > 6 ? int.Parse(args[6]) : int.MaxValue),
     _ => Harness.Usage(2),
 };

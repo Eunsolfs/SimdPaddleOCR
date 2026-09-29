@@ -162,7 +162,7 @@ x64 / ARM64 本库 peak 大约少 **300 MB**。c 仍然略省，但更慢。Open
 
 ### Vulkan GPU（RTX 3080 Ti，`8d62a35`）
 
-同机同轮：HOME-MAIN 5800X + RTX 3080 Ti（驱动 581.80），`.NET 10.0.11`，`--engine sharp|vulkan --workers 4 --benchmark-kind simd --warmup 1`，同一 `dataset/` 100 张变尺寸图（对 GPU 最不利的逐图新 shape）。墙钟 n=99。**CPU 列是同轮重测**，不要拿上表 1.4.2 的 `97c1448` mean 硬接（那次 tiny 63.1 / small 200 / medium 585）。B580 另一台机、另一份尺子，见 [vulkan-b580.md](vulkan-b580.md)；Radeon 880M 核显见 [vulkan-880m.md](vulkan-880m.md)。Intel UHD 770 没有协作矩阵，`Auto` 仍走 CPU，显式 `Vulkan` 走较慢的无矩阵档，见 [vulkan-uhd770.md](vulkan-uhd770.md)。
+同机同轮：HOME-MAIN 5800X + RTX 3080 Ti（驱动 581.80），`.NET 10.0.11`，`--engine sharp|vulkan --workers 4 --benchmark-kind simd --warmup 1`，同一 `dataset/` 100 张变尺寸图（对 GPU 最不利的逐图新 shape）。墙钟 n=99。**CPU 列是同轮重测**，不要拿上表 1.4.2 的 `97c1448` mean 硬接（那次 tiny 63.1 / small 200 / medium 585）。B580 另一台机、另一份尺子，见 [vulkan-b580.md](vulkan-b580.md)；Radeon 880M 核显见 [vulkan-880m.md](vulkan-880m.md)。Intel UHD 770 没有协作矩阵，`Auto` 仍走 CPU，显式 `Vulkan` 走较慢的无矩阵档，见 [vulkan-uhd770.md](vulkan-uhd770.md)。骁龙 8 Gen 3（Adreno 750，安卓）同样没有协作矩阵，但无矩阵档三档都快于本机 CPU，`Auto` 走 GPU，见 [vulkan-8gen3.md](vulkan-8gen3.md)。
 
 端到端（median ms/图，越低越好；加速 = CPU median / Vulkan median）：
 
@@ -227,6 +227,7 @@ JSON：`bench-out/local-5800x-c-{tiny,small,medium}-4w.json`。
 | 本机 5800X | —                                                                             | `97c1448` / `68a009a` | 墙钟/内存 `97c1448`；CER 左 1:4 后同机复测（1.4.2） |
 | 本机 Vulkan | —                                                                            | `8d62a35` | 5800X + 3080 Ti 同轮 sharp/vulkan 4w；tiny/small/medium；A/B 基线 `d6c260c` |
 | 880M Vulkan | —                                                                            | `2520c77` | 锐龙 AI 9 H365 + Radeon 880M 同轮 sharp/vulkan 4w；A/B 基线 `713fc03` / `d6c260c` |
+| 8 Gen 3 Vulkan | —                                                                         | `vulkan-android-8gen3` 分支 | 真我 GT5 Pro，`test/Sdcb.SimdPaddleOCR.AndroidBench`，本机 CPU / Vulkan 交替 3 轮 4w；见 [vulkan-8gen3.md](vulkan-8gen3.md) |
 
 推送或手动触发 [`.github/workflows/test.yml`](../.github/workflows/test.yml)，下载 `perf-report` artifact。本地同一套数据：
 

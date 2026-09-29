@@ -50,12 +50,14 @@ internal static class GpuBackend
 
     /// <summary>Whether a session for this option runs on the GPU. Without an
     /// fp16 cooperative matrix of the cm shaders' shape (<see cref="VkDevice.CoopGemm"/>)
-    /// only an explicit Vulkan choice gets the no-coopmat GEMM tier: it trails
-    /// the CPU on every model measured (docs/vulkan-uhd770.md), so Auto stays
-    /// on the CPU there.</summary>
+    /// Auto takes the no-coopmat GEMM tier only where compute subgroups cannot
+    /// go below 64 lanes: there (Adreno 750) it beats the CPU on every model
+    /// measured (docs/vulkan-8gen3.md), while on UHD 770, which pins 8 lanes,
+    /// it trails the CPU (docs/vulkan-uhd770.md). Other no-coopmat devices
+    /// only get the GPU for an explicit Vulkan choice.</summary>
     internal static bool UsesGpu(OcrBackend backend) =>
         IsVulkanSelected(backend) && TryGetDevice() is { } dev
-        && (dev.CoopGemm || IsVulkanExplicit(backend));
+        && (dev.CoopGemm || dev.SubgroupMin >= 64 || IsVulkanExplicit(backend));
 
     /// <summary>Creates a session on the resolved backend; CPU on any GPU failure.</summary>
     internal static IOcrSession CreateSession(CompiledModel compiled, OcrBackend backend)

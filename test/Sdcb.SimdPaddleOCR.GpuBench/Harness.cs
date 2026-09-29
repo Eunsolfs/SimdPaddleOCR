@@ -1,5 +1,18 @@
 namespace Sdcb.SimdPaddleOCR.GpuBench;
 
+static class DesktopPaths
+{
+    internal static int Run(Func<string[], int> mode, string[] args)
+    {
+        string root = AppContext.BaseDirectory;
+        while (root.Length > 3 && !File.Exists(Path.Combine(root, "Sdcb.SimdPaddleOCR.slnx")))
+            root = Path.GetDirectoryName(root.TrimEnd(Path.DirectorySeparatorChar))!;
+        AndroidBench.Paths.Root = root;
+        AndroidBench.Paths.ModelsDir = Path.Combine("bench-out", "models");
+        return mode(args);
+    }
+}
+
 static class Harness
 {
     internal static int Usage(int code)
@@ -26,6 +39,10 @@ static class Harness
               --sessiso <rec.onnx> <W>
               --reciso <det> <rec> <keys> <img>
               --detmap <det.onnx> <img>
+              --detcmp <tiny|small|medium> <img.jpg|all|N> [maxSide]   CPU vs Vulkan DET map + boxes
+              --reccmp <tiny|small|medium> <batch> <W>                 CPU vs Vulkan REC activations
+              --gemm <shader|file.spv> <M> <N> <K> [flags] [tileM] [tileN] [reqSg] [reps]   GEMM vs fp64 reference
+              --layers <onnx> <N> <H> <W> [first] [last]   per-node output stats of the truncated GPU graph
               --recreal <det> <rec> <img> [W]
             """);
         return code;

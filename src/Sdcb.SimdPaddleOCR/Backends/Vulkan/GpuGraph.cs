@@ -81,11 +81,14 @@ internal sealed class GpuGraphModel
     private readonly bool _lite;
     // No coopmat of the selected cm set's shape (VkDevice.CoopGemm):
     // subgroup-free gemm_nc instead of every cm pipe
-    // (Intel's compiler aborts the process on those shaders). Sessions only
-    // reach this for an explicit OcrBackend.Vulkan — GpuBackend.UsesGpu.
+    // (Intel's compiler aborts the process on those shaders). Auto sessions
+    // reach this only on wave64-minimum devices — GpuBackend.UsesGpu.
     private readonly bool _nocm;
     // gemm_nc built with the unrolled no-act / relu / hardswish, single-output tail
     private readonly VkPipeline? _pGemmNcS;
+    // no-coopmat tier on a device that cannot pin a narrow subgroup (Adreno
+    // wave64): direct-load GEMM plus the routing measured on Adreno 750
+    private readonly bool _ncWide;
 
     // fp16 copies of constant tensors (weights, biases, scalars), lazy
     private readonly Dictionary<(int, int, int, int), VkBuffer> _constF16 = new();
@@ -197,10 +200,13 @@ internal sealed class GpuGraphModel
         {
             // One tile; n64/n32 stay aliases so CmTile's sg16 cout split is
             // not reused here. 8 lanes keep its 64 fp32 accumulators in
-            // registers (UHD 770: SIMD16 spills, 4x slower).
+            // registers (UHD 770: SIMD16 spills, 4x slower). Without an
+            // 8-lane pin (wave64 Adreno) the register-prefetch form is
+            // miscompiled there; the direct-load build is exact and faster.
             bool sg8 = dev.ComputeSubgroupSize && dev.SubgroupMin <= 8 && dev.SubgroupMax >= 8;
-            _pConv1x1 = Pipe("gemm_nc", 6, 16, sg8 ? 8u : 0u);
-            _pGemmNcS = Pipe("gemm_nc_s", 6, 16, sg8 ? 8u : 0u);
+            _ncWide = !sg8;
+            _pConv1x1 = sg8 ? Pipe("gemm_nc", 6, 16, 8u) : Pipe("gemm_nc_d", 6, 16);
+            _pGemmNcS = sg8 ? Pipe("gemm_nc_s", 6, 16, 8u) : Pipe("gemm_nc_ds", 6, 16);
             _pConv1x1N64 = _pConv1x1;
             _pConv1x1N32 = _pConv1x1;
         }
@@ -314,7 +320,9 @@ internal sealed class GpuGraphModel
         }
         else
         {
-            alloc = Math.Max(n, padRows * rowElems);
+            // whole 16 B: kernels read scalars as a packed half pair / f16vec4,
+            // and Adreno bounds-checks every load against the binding range
+            alloc = (Math.Max(n, padRows * rowElems) + 7) / 8 * 8;
             h = new Half[alloc];
             for (int i = 0; i < n; i++) h[i] = (Half)f32[i];
         }
@@ -347,7 +355,7 @@ internal sealed class GpuGraphModel
     private VkBuffer VecF16((int, int) key, float[] v)
     {
         if (_vecF16.TryGetValue(key, out VkBuffer? cached)) return cached;
-        Half[] h = new Half[v.Length];
+        Half[] h = new Half[(v.Length + 7) / 8 * 8];
         for (int i = 0; i < v.Length; i++) h[i] = (Half)v[i];
         VkBuffer buf = _dev.NewStorageBuffer((ulong)h.Length * 2, hostVisible: false);
         unsafe { fixed (Half* p = h) _dev.Upload(buf, p, (ulong)h.Length * 2); }
@@ -665,6 +673,9 @@ internal sealed class GpuGraphModel
             if (i == inIdx && inCinPad != 0)
                 sz = numel[i] / shapes[i][1] * inCinPad;
             slabElems[i] = (sz + 7) / 8 * 8 + 128 * 64;
+            if (slabElems[i] * 2 > (long)_dev.MaxStorageRange)
+                throw new NotSupportedException(
+                    $"tensor {i} ({sz * 2} B) exceeds maxStorageBufferRange {_dev.MaxStorageRange}");
             cursor += slabElems[i];
         }
         // the im2col scratch sits past every slab; its size (and the arena
@@ -1407,10 +1418,15 @@ internal sealed class GpuGraphModel
                         // sg32: implicit-GEMM coopmat conv instead (same tap
                         // addressing, tensor cores; any K, batched or not)
                         bool convkCm = _sg32 && cinIn % 8 == 0 && scalarBias == 0;
+                        // the im2col matrix is one binding: past
+                        // maxStorageBufferRange (Adreno: 128 MB) go direct
+                        bool im2colFits = (long)M * Kp * 2 <= (long)_dev.MaxStorageRange;
+                        // wide no-coopmat parts: direct at every K measured
+                        // (Kp <= 2304 in these models), im2col+GEMM never won
                         if (convkCm || (cout % 4 == 0 && scalarBias == 0 && cinIn % 4 == 0
-                            && (nb > 1 || Kp <= (Environment.GetEnvironmentVariable(
+                            && (nb > 1 || !im2colFits || Kp <= (Environment.GetEnvironmentVariable(
                                 "SIMD_OCR_CONVD_KMAX") is string km
-                                ? int.Parse(km) : 1024))
+                                ? int.Parse(km) : _ncWide ? int.MaxValue : 1024))
                             && Environment.GetEnvironmentVariable("SIMD_OCR_NODCONV") == null))
                         {
                             // stem conv on the fp32 NCHW input: skip nchw2nhwc
@@ -1494,6 +1510,9 @@ internal sealed class GpuGraphModel
                         if (nb > 1)
                             throw new NotSupportedException(
                                 $"im2col conv path lacks batch support (n{ni})");
+                        if (!im2colFits)
+                            throw new NotSupportedException(
+                                $"im2col matrix {M}x{Kp} exceeds maxStorageBufferRange (n{ni})");
                         maxIm2col = Math.Max(maxIm2col, (long)M * Kp);
                         Emit(_pIm2col, $"im2col n{ni} M{M} K{K}",
                             [(arena, SlotOf(node.Inputs[0]), 2),
@@ -1717,9 +1736,9 @@ internal sealed class GpuGraphModel
                         seCtr += nb;   // one ticket counter per batch
                         break;
                     }
-                    // lite parts take it at any size: reduce_hw's one-channel
-                    // workgroups read 2 bytes at a C*2 stride
-                    if (c % 4 == 0 && 256 % cv4 == 0 && (hw >= 4096 || _lite))
+                    // lite and wide no-coopmat parts take it at any size:
+                    // reduce_hw's one-channel workgroups read 2 bytes at a C*2 stride
+                    if (c % 4 == 0 && 256 % cv4 == 0 && (hw >= 4096 || _lite || _ncWide))
                     {
                         // two-phase: S pixel partitions → fp32 partials → mean
                         int s = PartSplits(hw, c);

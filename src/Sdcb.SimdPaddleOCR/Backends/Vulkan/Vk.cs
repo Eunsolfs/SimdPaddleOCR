@@ -1,5 +1,6 @@
 // Minimal Vulkan 1.1 P/Invoke for compute-only use (SimdPaddleOCR Vulkan backend).
-// Loads vulkan-1.dll (Windows) / libvulkan.so.1 (Linux) via SetDllImportResolver.
+// Loads vulkan-1.dll (Windows) / libvulkan.so.1 (Linux) / libvulkan.so (Android)
+// via SetDllImportResolver.
 // Only the entry points and structs we need; all structs are blittable.
 using System.Runtime.InteropServices;
 
@@ -11,6 +12,10 @@ internal static unsafe partial class Vk
 
     private static int _resolverRegistered;
 
+    // Android ships only the unversioned NDK name (/system/lib64/libvulkan.so)
+    private static readonly string[] s_candidates = OperatingSystem.IsWindows()
+        ? ["vulkan-1.dll"] : ["libvulkan.so.1", "libvulkan.so"];
+
     public static void RegisterResolver()
     {
         if (Interlocked.Exchange(ref _resolverRegistered, 1) != 0)
@@ -19,10 +24,19 @@ internal static unsafe partial class Vk
         {
             if (name != LibName)
                 return IntPtr.Zero;
-            string candidate = OperatingSystem.IsWindows() ? "vulkan-1.dll" : "libvulkan.so.1";
-            return NativeLibrary.TryLoad(candidate, out IntPtr h) ? h : IntPtr.Zero;
+            foreach (string candidate in s_candidates)
+                if (NativeLibrary.TryLoad(candidate, out IntPtr h))
+                {
+                    LoadedLibrary = candidate;
+                    return h;
+                }
+            throw new DllNotFoundException(
+                $"Vulkan loader not found (tried {string.Join(", ", s_candidates)})");
         });
     }
+
+    /// <summary>File name the resolver loaded, or null before the first call.</summary>
+    public static string? LoadedLibrary { get; private set; }
 
     public const ulong WholeSize = ~0UL;
     public const uint QueueFamilyIgnored = ~0u;
@@ -66,6 +80,10 @@ internal static unsafe partial class Vk
         public uint MaxComputeSharedMemorySize
         {
             get { fixed (byte* p = LimitsAndSparse) return *(uint*)(p + 4 + 216); }
+        }
+        public uint MaxStorageBufferRange
+        {
+            get { fixed (byte* p = LimitsAndSparse) return *(uint*)(p + 4 + 28); }
         }
     }
 
