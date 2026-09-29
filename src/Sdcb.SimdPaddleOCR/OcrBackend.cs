@@ -3,7 +3,7 @@ namespace Sdcb.SimdPaddleOCR;
 /// <summary>Compute backend for the OCR graph stages.</summary>
 public enum OcrBackend
 {
-    /// <summary>Prefer Vulkan when a usable device exists, else CPU.</summary>
+    /// <summary>Prefer Metal on macOS arm64 and Vulkan elsewhere when a usable device exists, else CPU.</summary>
     Auto,
     /// <summary>Always run the CPU interpreter.</summary>
     Cpu,

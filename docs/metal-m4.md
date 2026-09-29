@@ -1,16 +1,16 @@
 # SimdPaddleOCR — Apple Silicon Metal 后端实测（Devin VM / M4 paravirt）
 
-实测机：macOS VM（Apple M4 paravirt GPU，8 vCPU），SDK .NET 10，`test/Sdcb.SimdPaddleOCR.Tests` bench（`--workers 4 --benchmark-kind simd --engine sharp|metal`，warmup=1，n=99，dataset/ 100 张固定图、张张不同尺寸）。commit：`metal-backend` 分支（PR #21），性能数据采集于 `680bf38`（其后的 review 修订不动热路径）。
+实测机：macOS VM（Apple M4 paravirt GPU，8 vCPU），SDK .NET 10，`test/Sdcb.SimdPaddleOCR.Tests` bench（`--workers 4 --benchmark-kind simd --engine sharp|metal`，warmup=1，n=99，dataset/ 100 张固定图、张张不同尺寸）。commit：`metal-backend` 分支（PR #21），下表为 review 修订（concurrent encoder、device 级 MSL lib/PSO cache）之后在同一轮重测的数据。
 
-**结论：三档 Metal 全部净胜 CPU（tiny 1.9× / small 4.7× / medium 5.2×），检测行数与 CPU 完全一致，文本差异仅 fp16 级噪声（3 图各 1 字符）。受 paravirt 虚拟化所限绝对数偏保守——实测 MMA≈fp32≈3TFLOPS、copy ~84GB/s、dispatch ~45µs，均低于真机 M4，真机数字预期更好。**
+**结论：三档 Metal 全部净胜 CPU（tiny 1.75× / small 4.00× / medium 6.47×），检测行数与 CPU 完全一致，文本差异为 fp16 级噪声（vs CPU 逐图差：tiny 11 图、small 4 图、medium 3 图，多数为单字符空格增减；medium 的 exact_lines/CER 反而略优于 CPU）。受 paravirt 虚拟化所限绝对数偏保守——实测 MMA≈fp32≈3TFLOPS、copy ~84GB/s、dispatch ~45µs，均低于真机 M4，真机数字预期更好。**
 
 ## 端到端（4 workers，median ms/图，越低越好）
 
 | 模型 | CPU(sharp) | Metal | 比值 | CPU img/s | GPU img/s |
 |---|---:|---:|---:|---:|---:|
-| tiny   | 73.9  | **38.9**  | 1.90× | 13.5 | 25.7 |
-| small  | 269.7 | **57.1**  | 4.72× | 3.7  | 17.5 |
-| medium | 935.5 | **178.4** | 5.24× | 1.07 | 5.6  |
+| tiny   | 68.8  | **39.3**  | 1.75× | 14.5 | 25.4 |
+| small  | 218.4 | **54.6**  | 4.00× | 4.6  | 18.3 |
+| medium | 693.0 | **107.0** | 6.47× | 1.44 | 9.35 |
 
 注：与 Vulkan/B580 表口径相同（dataset 变 shape 是最不利 GPU 的场景）。Metal 走 `OcrBackend.Metal`（Auto 在 macOS+Metal 可用时自动选）。
 
@@ -18,25 +18,31 @@
 
 | 模型 | 阶段 | CPU | Metal | 倍率 |
 |---|---|---:|---:|---:|
-| tiny   | det_graph | 35.5 | 12.7 | 2.8× |
-| tiny   | cls_graph | 11.3 | 3.25 | 3.5× |
-| tiny   | rec_graph | 99.7 | 15.9 | 6.3× |
-| small  | det_graph | 104.7 | 14.9 | 7.0× |
-| small  | cls_graph | 12.2 | 2.45 | 5.0× |
-| small  | rec_graph | 585.5 | 33.3 | 17.6× |
-| medium | det_graph | 315.1 | 59.6 | 5.3× |
-| medium | cls_graph | 11.9 | 2.61 | 4.6× |
-| medium | rec_graph | 2322.2 | 112.6 | 20.6× |
+| tiny   | det_graph | 44.0 | 13.0 | 3.4× |
+| tiny   | cls_graph | 12.2 | 4.3 | 2.8× |
+| tiny   | rec_graph | 101.7 | 18.6 | 5.5× |
+| small  | det_graph | 124.6 | 13.6 | 9.2× |
+| small  | cls_graph | 12.0 | 3.2 | 3.8× |
+| small  | rec_graph | 495.4 | 31.4 | 15.8× |
+| medium | det_graph | 317.4 | 33.1 | 9.6× |
+| medium | cls_graph | 12.4 | 3.2 | 3.9× |
+| medium | rec_graph | 1877.8 | 68.9 | 27.3× |
 
-精度：metal/sharp 检出 lines 完全一致（1016/1009/1013）；逐图 hash 3 张差（fp16 阈值临界像素，与 Vulkan 同型已知限制）；文本 3 图各差 1 字符（CER 口径：对 dataset 真值标注的字符错误率——Metal 0.67% vs CPU 0.14%，在 fp16 噪声范围内）。并发正确性：`--conc`（4 线程 × 72 runs/模型）0 mismatch；det medium 228 节点逐节点对拍（本地 probe 工具，未提交）× 8 跑 bitwise 一致。
+精度（与性能表同一轮 JSON 跑出的三个口径）：
+
+- **检出**：metal/sharp 逐图 `detected` 完全一致（1016/1009/1013，共 300 runs 0 差）。
+- **对真值**（dataset 标注）：exact_lines — tiny 744/1024 = 744/1024、small 811/1024 = 811/1024、medium **897 vs 894（Metal 更高）**；CER — tiny 1.640% vs 1.614%、small 1.392% vs 1.396%、medium 0.665% vs 0.677%。
+- **对 CPU 逐图文本差**（同一轮的两个 JSON 直比）：tiny 11 图 / 49 字符（10 张为单字符空格增删，最差 img-078 差 38 字符）、small 4 图 / 4 字符、medium 3 图 / 3 字符；逐图 hash 差与文本差同集；CLS 旋转角 1 图翻转（tiny，含在上述集合内）。属 fp16 阈值临界噪声，与 Vulkan 同型已知限制。
+
+并发正确性：`--conc`（4 线程 × 72 runs/模型）0 mismatch；det medium 228 节点逐节点对拍（本地 probe 工具，未提交）× 8 跑 bitwise 一致。
 
 ## 内存与分配
 
 | 模型 | CPU peak WS | Metal peak WS |
 |---|---:|---:|
-| tiny   | 691 MB  | 574 MB |
-| small  | 857 MB  | 647 MB |
-| medium | 1691 MB | 948 MB |
+| tiny   | 688 MB  | 578 MB |
+| small  | 955 MB  | 649 MB |
+| medium | 1709 MB | 942 MB |
 
 GPU 侧 arena 是共享 grow-only device buffer + 托管 schedule（MetalSchedule 纯数据 LRU=512，逐 shape 录制代价为零），与 Vulkan 的 plan/arena 形态同构。托管堆分配 ~1.4–2.5MB/图。
 
@@ -70,4 +76,4 @@ GPU 侧 arena 是共享 grow-only device buffer + 托管 schedule（MetalSchedul
 - DET bs>1 resize 不支持（同 Vulkan）。
 - MSL 通用限制：device `memory_order` 只有 relaxed（非 paravirt 独有）→ 跨 WG 定序走两阶段 split + `memoryBarrierWithScope:Buffers`；paravirt 另限 `char16/uchar16` 不可用。
 - 序列化逐 dispatch profile（`SIMD_OCR_GPU_PROF`）有 ~0.4–0.5ms/dispatch 地板，绝对值偏大；真实比例看 `SIMD_OCR_GPU_TIME` 的墙钟分解。
-- 无 CI Metal 依赖：Metal 路径只在 macOS 上被选中，其他 OS 的测试和 bench 不会走到它。
+- CI：osx-arm64 smoke（macos-26 runner，paravirt GPU）以 `--engine metal` 跑 tiny 20 张，断言 stderr 含 `[metal] device:` breadcrumb、无 `fallback`、逐图 `detected` 与 CPU 一致、逐图 `texts` 与 CPU 的编辑距离 ≤3/图且合计 ≤8（fp16 噪声允许量）；其他 OS 的测试不会走到 Metal 路径。
