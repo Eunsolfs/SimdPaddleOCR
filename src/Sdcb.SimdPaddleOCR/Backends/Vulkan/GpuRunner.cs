@@ -36,10 +36,6 @@ internal sealed class GpuSchedule
     public long LastTick;
 }
 
-/// <summary>Streamed-run callback: units [first, first+count) of result
-/// (unit i at offsets[i]) are complete. Return false to stop receiving
-/// further batches.</summary>
-
 /// <summary>
 /// Per-session GPU runtime over a shared <see cref="GpuGraphModel"/>: owns
 /// the fp16 arena, fp32 input/output buffers, partials scratch, a private

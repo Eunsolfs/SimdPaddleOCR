@@ -37,10 +37,6 @@ internal sealed class MetalSchedule
     public long LastTick;
 }
 
-/// <summary>Streamed-run callback: units [first, first+count) of result
-/// (unit i at offsets[i]) are complete. Return false to stop receiving
-/// further batches.</summary>
-
 /// <summary>
 /// Per-session Metal runtime over a shared <see cref="MetalGraphModel"/>:
 /// owns the fp16 arena, fp32 input/output buffers and the partials scratch —
