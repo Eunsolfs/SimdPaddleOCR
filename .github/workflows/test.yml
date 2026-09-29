@@ -81,11 +81,37 @@ jobs:
           if (-not $IsWindows) { chmod +x $exe }
           & $exe --smoke --count 20 --engine sharp --workers 4 --model tiny --input dataset --case-id '${{ matrix.name }}' --out '${{ matrix.name }}-smoke.json'
           if ($LASTEXITCODE -ne 0) { throw "smoke failed: $LASTEXITCODE" }
+      - name: Metal smoke (osx-arm64)
+        if: matrix.name == 'osx-arm64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = 'artifacts/net10/Sdcb.SimdPaddleOCR.Tests'
+          $env:DOTNET_ROOT = Join-Path $HOME '.dotnet'
+          & $exe --smoke --count 20 --engine metal --workers 4 --model tiny --input dataset --case-id 'osx-arm64-metal' --out 'osx-arm64-metal-smoke.json' 2> metal-stderr.txt
+          if ($LASTEXITCODE -ne 0) { throw "metal smoke failed: $LASTEXITCODE" }
+          Get-Content metal-stderr.txt
+          if (-not (Select-String -Path metal-stderr.txt -Pattern '\[metal\] device:' -Quiet)) {
+            throw 'Metal device never engaged — the smoke silently ran on CPU'
+          }
+          if (Select-String -Path metal-stderr.txt -Pattern '\[metal\].*fallback' -Quiet) {
+            throw 'metal session fell back to CPU'
+          }
+          $cpu = Get-Content 'osx-arm64-smoke.json' | ConvertFrom-Json
+          $mtl = Get-Content 'osx-arm64-metal-smoke.json' | ConvertFrom-Json
+          for ($i = 0; $i -lt $cpu.rows.Count; $i++) {
+            if ($cpu.rows[$i].detected -ne $mtl.rows[$i].detected) {
+              throw "metal detected-line count differs on $($cpu.rows[$i].file): $($cpu.rows[$i].detected) vs $($mtl.rows[$i].detected)"
+            }
+          }
+          Write-Output "metal smoke OK: $($mtl.rows.Count) images, detected-line counts identical to CPU"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: smoke-platform-${{ matrix.name }}
-          path: ${{ matrix.name }}-smoke.json
+          path: |
+            ${{ matrix.name }}-smoke.json
+            ${{ matrix.name }}-metal-smoke.json
           if-no-files-found: warn
 
   smoke-models:
