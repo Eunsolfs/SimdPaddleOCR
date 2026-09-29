@@ -76,4 +76,4 @@ GPU 侧 arena 是共享 grow-only device buffer + 托管 schedule（MetalSchedul
 - DET bs>1 resize 不支持（同 Vulkan）。
 - MSL 通用限制：device `memory_order` 只有 relaxed（非 paravirt 独有）→ 跨 WG 定序走两阶段 split + `memoryBarrierWithScope:Buffers`；paravirt 另限 `char16/uchar16` 不可用。
 - 序列化逐 dispatch profile（`SIMD_OCR_GPU_PROF`）有 ~0.4–0.5ms/dispatch 地板，绝对值偏大；真实比例看 `SIMD_OCR_GPU_TIME` 的墙钟分解。
-- CI：osx-arm64 smoke（macos-26 runner，paravirt GPU）以 `--engine metal` 跑 tiny 20 张，断言 stderr 含 `[metal] device:` breadcrumb、无 `fallback`、逐图 `detected` 与 CPU 一致、逐图 `texts` 与 CPU 的编辑距离 ≤3/图且合计 ≤8（fp16 噪声允许量）；其他 OS 的测试不会走到 Metal 路径。
+- CI：osx-arm64 smoke（macos-26 runner，paravirt GPU）以 `--engine metal` 跑 tiny 20 张，断言 stderr 含 `[metal] device:`、无 `fallback`、逐图 `detected` 与 CPU 一致；不比较文本，文本漂移靠本文的逐图对比数据把关（已接受的限制：CI 发现不了「框数对、文本错」类回归）；其他 OS 的测试不会走到 Metal 路径。
