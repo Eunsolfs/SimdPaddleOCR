@@ -30,6 +30,8 @@ public sealed class PaddleOcrAll : IDisposable
     private readonly int _cropWorkers;
     private readonly int _recIntraOpBase;
     private readonly int _recIntraOpMax;
+    private readonly bool _recGpu;
+    private readonly int _recBatchEffective;
     private readonly List<byte[]> _cropBuffers = [];
     private readonly object _cropLock = new();
     private bool _disposed;
@@ -128,6 +130,9 @@ public sealed class PaddleOcrAll : IDisposable
         _recognizer = new PaddleOcrRecognizer(recognizerModel ?? throw new ArgumentNullException(nameof(recognizerModel)),
             dictionaryUtf8, _options.Recognizer, ownsModel: false,
             _recIntraOpBase);
+        _recGpu = OnnxSharp.OcrSessionFactory.IsGpuBackend(_options.Recognizer.Backend);
+        _recBatchEffective = _options.HasExplicitRecBatchLines ? _options.RecBatchLines
+            : _recGpu ? 16 : _options.RecBatchLines;
     }
 
     private static byte[] ReadDictionary(Stream source)
@@ -271,8 +276,10 @@ public sealed class PaddleOcrAll : IDisposable
             int recIntraOp = LineIntraOpBudget(count);
             // Same-width batched REC is opt-in: it is numerically exact, but
             // per-op whole-batch execution inflates the activation working set
-            // and measured slower than per-line REC on desktop CPUs.
-            int maxBatch = Math.Max(1, _options.RecBatchLines);
+            // and measured slower than per-line REC on desktop CPUs. On a GPU
+            // backend batching is the main win, so the default is raised there
+            // unless the caller set RecBatchLines explicitly.
+            int maxBatch = Math.Max(1, _recBatchEffective);
             if (maxBatch > 1)
             {
                 ProcessLinesBatched(count, workerCount, maxBatch, cropBuffer, cropOffsets,
@@ -374,7 +381,26 @@ public sealed class PaddleOcrAll : IDisposable
         PaddleOcrRecognitionResult[] recResults = new PaddleOcrRecognitionResult[count];
         try
         {
-            if (workerCount <= 1)
+            if (_classifier is { GpuCapable: true })
+            {
+                // GPU: one batched classify for all lines (fixed [n,3,80,160]
+                // input — single submit, head resolved on CPU), then the cheap
+                // rotate/width-select tail fans out across workers.
+                _classifier.ClassifyBatch(cropBuffer, offsets, bytes, widths, heights,
+                    count, labels, clsScores, _cropWorkers);
+                if (workerCount <= 1)
+                {
+                    PostClassifyRange(0, count, 1, cropBuffer, offsets, bytes, widths,
+                        heights, labels, clsScores, rotations, recWidths);
+                }
+                else
+                {
+                    Parallel.For(0, workerCount, worker =>
+                        PostClassifyRange(worker, count, workerCount, cropBuffer, offsets,
+                            bytes, widths, heights, labels, clsScores, rotations, recWidths));
+                }
+            }
+            else if (workerCount <= 1)
             {
                 ClassifyRange(0, count, 1, cropBuffer, offsets, bytes, widths, heights,
                     labels, clsScores, rotations, recWidths);
@@ -386,29 +412,46 @@ public sealed class PaddleOcrAll : IDisposable
                         widths, heights, labels, clsScores, rotations, recWidths));
             }
 
-            Dictionary<int, List<int>> groups = [];
-            List<int[]> units = [];
-            for (int i = 0; i < count; i++)
+            // Exact-width groups: each unit runs at its members' own target
+            // width, so no line sees extra padding. That matters for SVTR
+            // recognizers (global attention mixes every column, so padding a
+            // line past its bucket changes its logits) and costs nothing on
+            // GPU, where all units of the image go out in one submission.
+            List<int[]> units;
             {
-                if (!groups.TryGetValue(recWidths[i], out List<int>? members))
-                    groups[recWidths[i]] = members = [];
-                members.Add(i);
-                if (members.Count == maxBatch)
+                Dictionary<int, List<int>> groups = [];
+                units = [];
+                for (int i = 0; i < count; i++)
                 {
-                    units.Add([.. members]);
-                    members.Clear();
+                    if (!groups.TryGetValue(recWidths[i], out List<int>? members))
+                        groups[recWidths[i]] = members = [];
+                    members.Add(i);
+                    if (members.Count == maxBatch)
+                    {
+                        units.Add([.. members]);
+                        members.Clear();
+                    }
                 }
+                foreach (List<int> members in groups.Values)
+                    if (members.Count > 0)
+                        units.Add([.. members]);
             }
-            foreach (List<int> members in groups.Values)
-                if (members.Count > 0)
-                    units.Add([.. members]);
 
             int unitWorkers = Math.Max(1, Math.Min(workerCount, units.Count));
             // Idle workers' cores go to the units actually running: a single
             // same-width group may shard across the whole machine.
             int unitIntraOp = MathCompat.Clamp(_recIntraOpBase * _lineWorkers / unitWorkers,
                 _recIntraOpBase, _recIntraOpMax);
-            if (workerCount <= 1 || units.Count <= 1)
+            // GpuRecAlive flips false once a session reports its rec graph fell
+            // back to CPU; then the per-unit CPU-shaped path below takes over.
+            long recStart = s_profileEnabled ? Stopwatch.GetTimestamp() : 0;
+            if (_recGpu && _recognizer.GpuRecAlive
+                && _recognizer.TryRecognizeUnitsBatched(cropBuffer, offsets, bytes, widths, heights,
+                    units, recWidths, recResults, _recIntraOpMax, _cropWorkers, returnCtcAlignment))
+            {
+                if (s_profileEnabled) AddProfile(4, recStart);
+            }
+            else if (workerCount <= 1 || units.Count <= 1)
             {
                 foreach (int[] unit in units)
                     RecognizeUnit(unit, unitIntraOp, cropBuffer, offsets, bytes, widths, heights, recWidths,
@@ -475,6 +518,26 @@ public sealed class PaddleOcrAll : IDisposable
             labels[i] = label;
             clsScores[i] = clsScore;
             rotations[i] = rotation;
+            recWidths[i] = _recognizer.SelectWidthForCrop(widths[i], heights[i]);
+        }
+    }
+
+    // Post-batch tail of ClassifyRange: rotates 180°-flagged crops in place and
+    // fills per-line REC target widths. Runs after a batched classifier call
+    // that already produced labels/clsScores for every line.
+    private void PostClassifyRange(int first, int count, int stride, byte[] cropBuffer,
+        int[] offsets, int[] bytes, int[] widths, int[] heights, uint[] labels,
+        float[] clsScores, int[] rotations, int[] recWidths)
+    {
+        for (int i = first; i < count; i += stride)
+        {
+            int rotation = 0;
+            if ((labels[i] & 1u) != 0 && clsScores[i] > _options.ClassifierThreshold)
+            {
+                PPOCRCrop.Rotate180(cropBuffer.AsSpan(offsets[i], bytes[i]), widths[i], heights[i]);
+                rotation = 180;
+            }
+            rotations[i] = rotation;   // rented array — must write every slot
             recWidths[i] = _recognizer.SelectWidthForCrop(widths[i], heights[i]);
         }
     }
