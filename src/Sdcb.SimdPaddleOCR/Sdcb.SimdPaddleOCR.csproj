@@ -18,7 +18,8 @@
     <None Include="..\..\README.md" Pack="true" PackagePath="README.md" />
     <None Include="linqpad-samples\*.linq" Pack="true" PackagePath="linqpad-samples" />
   </ItemGroup>
-  <ItemGroup>
+  <!-- ns2.0 不包含 GPU 后端，不嵌入 SPIR-V / Metal shader。 -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
     <EmbeddedResource Include="Backends\Vulkan\Shaders\*.spv" />
     <None Remove="Backends\Vulkan\Shaders\*.spv" />
     <EmbeddedResource Include="Backends\Metal\Shaders\*.metal" />
